@@ -12,7 +12,13 @@ This document:
 - Maps Mastra's memory model onto OpenCode's architecture.
 - Recommends an implementation strategy (plugin-first vs fork/core).
 
-Limitations: I did not clone either repo locally in this workspace; analysis is based on reading upstream files via raw GitHub fetches and Mastra docs.
+Verification approach: initial analysis used upstream raw GitHub fetches and Mastra docs, then findings were validated with local clones pinned to these SHAs:
+- `anomalyco/opencode`: `78069369e2253c9788c09b7a71478d140c9741f2` (branch `dev` at time of analysis)
+- `mastra-ai/mastra`: `23b43ddd0e3db05dee828c2733faa2496b7b0319` (branch `main` at time of analysis)
+
+Correction from local verification:
+- At this Mastra SHA, code defaults `semanticRecall` to `false` in `packages/core/src/memory/memory.ts` (`memoryDefaultOptions`).
+- Some docs/pages describe semantic recall as enabled by default; for implementation planning against this SHA, treat semantic recall as opt-in.
 
 ---
 
@@ -354,56 +360,57 @@ Integrate memory selection in `SessionPrompt.loop()`:
 
 ## Phased Roadmap (Per-Repo First)
 
-### Phase 1: Working Memory (fastest value)
+Given the target use case (long multi-hour coding sessions with heavy tool output), prioritize Observational Memory before Semantic Recall.
 
-Plugin implementation:
-- Add a `updateWorkingMemory` tool (Mastra-like semantics):
-  - start with Markdown replace mode.
-  - optionally add schema/JSON merge mode later.
-- Inject a system instruction describing when to update memory.
-- Persist per `projectId`.
+### Phase 1: Observational Memory (primary)
 
-Key design choices:
-- Template:
-  - Keep it short and structured (names, prefs, goals, repo-specific decisions).
-  - Avoid “log style” data here; that’s observational memory.
+Two viable implementation paths:
 
-### Phase 2: Semantic Recall
-
-Plugin implementation:
-- Embedding model:
-  - start with a single provider/model string.
-  - add config to switch later.
-- Vector storage options:
-  1) Local: SQLite + `sqlite-vec` / `sqlite-vss`
-  2) Remote: pgvector/pinecone/etc.
-
-Indexing policy:
-- Embed:
-  - user text parts
-  - assistant text parts
-  - optionally summarized tool output (never raw huge logs)
-
-Retrieval policy:
-- topK + messageRange (Mastra-style)
-- filter by `projectId`
-- inject as a single compact block (avoid flooding context)
-
-### Phase 3: Observational Memory
-
-Two viable approaches:
-
-Approach A: “Upgrade Compaction” (quickest)
-- Use `experimental.session.compacting` to change compaction output format into an OM-like observation log:
+Approach A: “Upgrade Compaction” (fastest path)
+- Use `experimental.session.compacting` to generate OM-style output instead of generic continuation summary:
   - `<observations>`
   - `<current-task>`
   - `<suggested-response>`
-- Persist that as project-scoped observations, and inject it every turn.
+- Persist observations per `projectId` and inject them each turn via `experimental.chat.system.transform`.
+- Keep OpenCode's existing prune behavior for old tool outputs.
 
-Approach B: True OM (Mastra-like)
+Approach B: True OM (closer to Mastra)
 - Implement Observer/Reflector background runs.
-- Maintain activation markers and drop observed raw history from context proactively.
-- Consider using `Scheduler.register(...)` for background buffering.
+- Track observation/reflection thresholds and activation markers.
+- Proactively keep raw message history small while preserving continuity.
+- Use `Scheduler.register(...)` for background buffering/reflection tasks.
+
+Recommended for Phase 1: start with Approach A (OM-lite), then evolve toward B once quality is validated.
+
+### Phase 2: Working Memory (minimal + bounded)
+
+Use Working Memory only for compact, durable profile/state facts (not event logs).
+
+Plugin implementation:
+- Add `updateWorkingMemory` tool (start with Markdown replace semantics).
+- Persist per `projectId`.
+- Inject WM as a compact system block.
+
+Bloat mitigation (important):
+- Keep a strict token budget (for example 300-800 tokens max).
+- Use a fixed template with small slots (preferences, goals, constraints, repo decisions).
+- Never store chronological logs or tool traces in WM; that belongs in OM.
+- Update only on real change; avoid rewriting unchanged content each turn.
+- Add periodic cleanup/compaction for stale fields.
+
+### Phase 3: Semantic Recall (optional)
+
+Add only if you need high-fidelity recall of specific old details that OM/WM do not retain.
+
+Plugin implementation:
+- Embedding model: start with one provider/model; make configurable later.
+- Vector storage:
+  1) Local: SQLite + `sqlite-vec` / `sqlite-vss`
+  2) Remote: pgvector/pinecone/etc.
+- Retrieval policy:
+  - topK + messageRange
+  - filter by `projectId`
+  - inject as one compact block to limit context bloat
 
 ---
 
@@ -424,27 +431,30 @@ Potential conflicts:
 
 ## Open Questions / Ambiguities (Not Blocking Phase 1)
 
-1) Vector backend preference for Phase 2:
+1) OM implementation depth for Phase 1:
+- compaction-upgrade only (OM-lite) vs early Observer/Reflector background agents
+
+2) Working memory budget policy (Phase 2):
+- exact max token budget
+- replacement rules when the budget is exceeded
+
+3) Vector backend preference for Phase 3 (if enabled):
 - local SQLite vector extension vs remote vector DB
 
-2) Data retention:
-- how long should semantic index keep old messages?
-- should tool outputs be indexed at all?
-
-3) Privacy controls:
+4) Privacy controls:
 - easy per-repo “forget all memory”
 - easy export/inspect
 
-4) Non-git projects:
+5) Non-git projects:
 - exact fallback resource key policy
 
 ---
 
 ## Suggested Next Step
 
-Implement Phase 1 as a plugin:
-- `opencode-memory-plugin` that adds `updateWorkingMemory` tool
-- stores WM at `${Global.Path.data}/memory/<projectId>/working-memory.md`
-- injects WM into system prompt every turn via `experimental.chat.system.transform`
+Implement Phase 1 as a plugin focused on OM-lite:
+- customize compaction output into `<observations>`, `<current-task>`, and `<suggested-response>`
+- store these per repo at `${Global.Path.data}/memory/<projectId>/observations.json`
+- inject OM context each turn via `experimental.chat.system.transform`
 
-Once that’s stable, add Phase 2 semantic recall.
+Then add bounded working memory (Phase 2), and defer semantic recall to Phase 3 if needed.
