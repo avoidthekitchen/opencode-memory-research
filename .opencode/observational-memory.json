@@ -1,5 +1,6 @@
 {
   "enabled": true,
+  "mode": "llm",
   "observeThresholdTokens": 30000,
   "reflectThresholdTokens": 40000,
   "rawMessageBudgetTokens": 32000,

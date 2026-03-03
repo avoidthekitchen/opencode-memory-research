@@ -23,21 +23,23 @@ Non-goals (still out of scope in Phase 1.1):
 
 ## Implementation TODO Status
 
-- [ ] Add `llm` mode config and keep deterministic mode as an explicit fallback option, not an automatic recovery path.
-- [ ] Replace `om_observe` tool args with structured observer output fields (`observations`, `currentTask`, `suggestedResponse`, optional cursor hint).
-- [ ] Replace `om_reflect` tool args with structured reflector output fields and optional compression retry level.
-- [ ] Add observer/reflection sanitization helpers for XML tag stripping, length caps, line dedupe, and degenerate-output rejection.
-- [ ] Add buffered-history formatting helpers for observe-required prompts using turn-grouped user/assistant/tool context.
-- [ ] Change maintenance flow so `ensureMemoryReady(...)` sets maintenance requirements instead of running deterministic observe/reflect when `mode=llm`.
-- [ ] Inject explicit observe/reflect system instructions and prompt payloads in `experimental.chat.system.transform`.
-- [ ] Optionally strengthen required tool descriptions through `tool.definition` on maintenance-required turns.
-- [ ] Keep `currentTask` and `suggestedResponse` injected whenever present, and explicitly clear stale values when omitted by a fresh observation result.
-- [ ] Keep pruning disabled while observe/reflect maintenance is required or deferred.
-- [ ] Preserve existing protected-tail pruning floor and `lastObserved.turnAnchorMessageID` cursor behavior once OM is current.
-- [ ] Update `om_status` to expose llm-mode maintenance state clearly enough to debug ignored or invalid maintenance calls.
-- [ ] Extend the smoke script expectations if needed for the new tool schemas and maintenance flow.
-- [ ] Run the minimum smoke validation with `node --experimental-strip-types scripts/smoke-om-plugin.mjs`.
+- [x] Add `llm` mode config and keep deterministic mode as an explicit fallback option, not an automatic recovery path.
+- [x] Replace `om_observe` tool args with structured observer output fields (`observations`, `currentTask`, `suggestedResponse`, optional cursor hint).
+- [x] Replace `om_reflect` tool args with structured reflector output fields and optional compression retry level.
+- [x] Add observer/reflection sanitization helpers for XML tag stripping, length caps, line dedupe, and degenerate-output rejection.
+- [x] Add buffered-history formatting helpers for observe-required prompts using turn-grouped user/assistant/tool context.
+- [x] Change maintenance flow so `ensureMemoryReady(...)` sets maintenance requirements instead of running deterministic observe/reflect when `mode=llm`.
+- [x] Inject explicit observe/reflect system instructions and prompt payloads in `experimental.chat.system.transform`.
+- [x] Optionally strengthen required tool descriptions through `tool.definition` on maintenance-required turns.
+- [x] Keep `currentTask` and `suggestedResponse` injected whenever present, and explicitly clear stale values when omitted by a fresh observation result.
+- [x] Keep pruning disabled while observe/reflect maintenance is required or deferred.
+- [x] Preserve existing protected-tail pruning floor and `lastObserved.turnAnchorMessageID` cursor behavior once OM is current.
+- [x] Update `om_status` to expose llm-mode maintenance state clearly enough to debug ignored or invalid maintenance calls.
+- [x] Extend the smoke script expectations if needed for the new tool schemas and maintenance flow.
+- [x] Run the minimum smoke validation with `node --experimental-strip-types scripts/smoke-om-plugin.mjs`.
 - [ ] Manually verify an OpenCode session where the model is forced to call `om_observe` before answering and OM is injected on the next loop.
+
+Note: the repo-local smoke path and direct plugin hook validation were completed in this implementation pass; the final unchecked item is a fuller end-to-end OpenCode session check.
 
 ## Mastra Documentation References
 
