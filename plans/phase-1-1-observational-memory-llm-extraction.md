@@ -37,9 +37,9 @@ Non-goals (still out of scope in Phase 1.1):
 - [x] Update `om_status` to expose llm-mode maintenance state clearly enough to debug ignored or invalid maintenance calls.
 - [x] Extend the smoke script expectations if needed for the new tool schemas and maintenance flow.
 - [x] Run the minimum smoke validation with `node --experimental-strip-types scripts/smoke-om-plugin.mjs`.
-- [ ] Manually verify an OpenCode session where the model is forced to call `om_observe` before answering and OM is injected on the next loop.
+- [x] Manually verify an OpenCode session where the model is forced to call `om_observe` before answering and OM is injected on the next loop.
 
-Note: the repo-local smoke path and direct plugin hook validation were completed in this implementation pass; the final unchecked item is a fuller end-to-end OpenCode session check.
+Status: completed. The repo-local smoke path, direct plugin hook validation, and the final end-to-end OpenCode session verification have all been completed.
 
 ## Mastra Documentation References
 
