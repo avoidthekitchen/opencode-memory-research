@@ -26,6 +26,18 @@ This phase is intentionally split into:
 1. a first pass that captures most of the accuracy benefit without architectural changes
 2. a final 10-15% accuracy pass that closes the remaining gap caused by provider/model serialization details
 
+## Implementation Status
+
+First-pass implementation status in this repo:
+
+- [x] Add a plugin-local `TokenCounter` under `.opencode/plugins/` using `js-tiktoken/lite` with `o200k_base`.
+- [x] Replace heuristic OM state/accounting writes with tokenized counts for buffer entries, durable memory, observe input, and trimming targets.
+- [x] Replace pruning's `JSON.stringify(messages)` estimate with transformed-message counting that ignores hidden metadata and non-visible parts.
+- [x] Include plugin-injected OM/task/maintenance blocks in token diagnostics and compute durable memory size from the injected OM block shape.
+- [x] Lazily recompute persisted token estimates on load/mutation without introducing a one-shot migration.
+- [x] Extend the focused smoke script with token-accounting checks and run the plugin-local smoke validation successfully on March 3, 2026.
+- [x] Run the optional full `--opencode` smoke path cleanly. On March 3, 2026 this passed after updating the smoke launcher to execute from `repos/opencode/packages/opencode`, which makes Bun use the package-local Solid JSX config instead of the workspace root config.
+
 ---
 
 ## Goals
