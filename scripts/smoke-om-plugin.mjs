@@ -30,7 +30,13 @@ async function runPluginSmoke() {
       path.join(root, ".opencode", "plugins", "observational-memory.ts"),
     ).href
   );
+  const tokenCounterModule = await import(
+    pathToFileURL(
+      path.join(root, ".opencode", "plugins", "token-counter.ts"),
+    ).href
+  );
   const { ObservationalMemoryPlugin } = pluginModule;
+  const { tokenCounter } = tokenCounterModule;
 
   const logs = [];
   const assistantParts = [
@@ -57,12 +63,47 @@ async function runPluginSmoke() {
 
   assertToolKeys(plugin);
   assertToolSchemas(plugin);
+  const tokenSamples = buildTokenSamples(tokenCounter);
 
   await plugin["chat.message"](
     { sessionID: "smoke-session", messageID: "user-1" },
     {
       message: { id: "user-1" },
       parts: [{ type: "text", text: "hello world" }],
+    },
+  );
+  await plugin["experimental.chat.messages.transform"](
+    {},
+    {
+      messages: [
+        {
+          info: {
+            id: "user-1",
+            role: "user",
+            sessionID: "smoke-session",
+          },
+          parts: [{ type: "text", text: "hello world" }],
+        },
+        {
+          info: {
+            id: "assistant-preview",
+            role: "assistant",
+            sessionID: "smoke-session",
+          },
+          parts: [
+            {
+              type: "tool",
+              tool: "read_file",
+              callID: "tool-call-1",
+              state: {
+                status: "completed",
+                input: { path: "/tmp/example.ts" },
+                output: "const value = 42;",
+              },
+            },
+          ],
+        },
+      ],
     },
   );
   await plugin.event({
@@ -110,6 +151,16 @@ async function runPluginSmoke() {
       `Smoke test failed: expected requiredTool=om_observe, got ${status.current.requiredTool}`,
     );
   }
+  if (status.current.diagnostics.transformedMessageTokens <= 0) {
+    throw new Error(
+      "Smoke test failed: transformed-message token diagnostics were not populated.",
+    );
+  }
+  if (status.current.diagnostics.tokenizer !== "js-tiktoken:o200k_base") {
+    throw new Error(
+      `Smoke test failed: unexpected tokenizer ${status.current.diagnostics.tokenizer}`,
+    );
+  }
 
   await plugin.tool.om_observe.execute(
     {
@@ -155,12 +206,18 @@ async function runPluginSmoke() {
       `Smoke test failed: expected no pending maintenance, got ${postStatus.current.requiredTool}`,
     );
   }
+  if (postStatus.current.diagnostics.injectedMemoryTokens <= 0) {
+    throw new Error(
+      "Smoke test failed: injected memory token diagnostics were not populated.",
+    );
+  }
 
   process.stdout.write(
     JSON.stringify(
       {
         mode: "plugin",
         ok: true,
+        tokenSamples,
         tools: Object.keys(plugin.tool).sort(),
         injectedSystemBlocks: postObserveSystem.system.length,
         logMessages: logs.map((entry) => entry.body.message),
@@ -169,6 +226,153 @@ async function runPluginSmoke() {
       2,
     ) + "\n",
   );
+}
+
+function buildTokenSamples(tokenCounter) {
+  const samples = {
+    prose:
+      "The user asked for a concise summary of the latest auth regression and wants the fix explained clearly.",
+    code: [
+      "```ts",
+      "export function sum(values: number[]) {",
+      "  return values.reduce((total, value) => total + value, 0);",
+      "}",
+      "```",
+    ].join("\n"),
+    json: JSON.stringify(
+      {
+        ok: true,
+        path: "/Users/example/project/src/auth.ts",
+        error: "Cannot read properties of undefined (reading 'token')",
+        line: 48,
+      },
+      null,
+      2,
+    ),
+    stack:
+      "Error: Cannot read properties of undefined (reading 'token')\n    at validateToken (/tmp/auth.ts:48:13)\n    at handleRequest (/tmp/server.ts:92:7)",
+  };
+
+  const comparisons = Object.fromEntries(
+    Object.entries(samples).map(([name, text]) => [
+      name,
+      {
+        heuristic: heuristicTokens(text),
+        tokenized: tokenCounter.countString(text),
+      },
+    ]),
+  );
+
+  const baseMessages = [
+    {
+      info: { role: "user" },
+      parts: [{ type: "text", text: "Please inspect src/auth.ts and explain the bug." }],
+    },
+    {
+      info: { role: "assistant" },
+      parts: [
+        {
+          type: "tool",
+          tool: "read_file",
+          callID: "tool-call-1",
+          state: {
+            status: "completed",
+            input: { path: "/tmp/src/auth.ts" },
+            output: "if (!token) throw new Error('missing token')",
+          },
+        },
+      ],
+    },
+  ];
+  const hiddenMetadataMessages = structuredClone(baseMessages);
+  hiddenMetadataMessages[0].info.metadata = { blob: "x".repeat(6000) };
+  hiddenMetadataMessages[0].parts[0].metadata = { blob: "y".repeat(6000) };
+
+  const baseCount = tokenCounter.countMessages(baseMessages);
+  const hiddenMetadataCount = tokenCounter.countMessages(hiddenMetadataMessages);
+  if (baseCount !== hiddenMetadataCount) {
+    throw new Error(
+      "Smoke test failed: hidden metadata changed prompt-visible token counting.",
+    );
+  }
+
+  const repeatA = tokenCounter.countMessages(baseMessages);
+  const repeatB = tokenCounter.countMessages(baseMessages);
+  if (repeatA !== repeatB) {
+    throw new Error(
+      "Smoke test failed: token counting was not stable across repeated runs.",
+    );
+  }
+
+  const singleMessageCount = tokenCounter.countMessage(baseMessages[0]);
+  const singleMessageBatch = tokenCounter.countMessages([baseMessages[0]]);
+  const repeatedMessageBatch = tokenCounter.countMessages([
+    baseMessages[0],
+    baseMessages[0],
+  ]);
+  const conversationOverheadSingle = singleMessageBatch - singleMessageCount;
+  const conversationOverheadRepeated =
+    repeatedMessageBatch - singleMessageCount * 2;
+  if (
+    conversationOverheadSingle <= 0 ||
+    conversationOverheadSingle !== conversationOverheadRepeated
+  ) {
+    throw new Error(
+      "Smoke test failed: countMessage() still appears to include conversation overhead.",
+    );
+  }
+
+  const mediaMessageShort = {
+    info: { role: "user" },
+    parts: [
+      {
+        type: "file",
+        mime: "image/png",
+        filename: "diagram.png",
+        url: "https://example.com/short.png",
+      },
+    ],
+  };
+  const mediaMessageLong = {
+    info: { role: "user" },
+    parts: [
+      {
+        type: "file",
+        mime: "image/png",
+        filename: "diagram.png",
+        url: "https://example.com/assets/" + "deep-path/".repeat(40) + "diagram.png",
+      },
+    ],
+  };
+  const mediaShortCount = tokenCounter.countMessage(mediaMessageShort);
+  const mediaLongCount = tokenCounter.countMessage(mediaMessageLong);
+  if (mediaLongCount <= mediaShortCount) {
+    throw new Error(
+      "Smoke test failed: user media counting still collapses visible file parts into a fixed placeholder.",
+    );
+  }
+
+  return {
+    comparisons,
+    promptVisibleMetadataCheck: {
+      baseCount,
+      hiddenMetadataCount,
+    },
+    singleMessageCheck: {
+      singleMessageCount,
+      singleMessageBatch,
+      repeatedMessageBatch,
+      conversationOverheadSingle,
+    },
+    mediaCheck: {
+      mediaShortCount,
+      mediaLongCount,
+    },
+  };
+}
+
+function heuristicTokens(text) {
+  return Math.ceil(text.length / 4);
 }
 
 function runOpencodeSmoke() {
@@ -186,10 +390,10 @@ function runOpencodeSmoke() {
     "bun",
     [
       "run",
-      "--cwd",
-      path.join(root, "repos", "opencode"),
       "--conditions=browser",
-      "packages/opencode/src/index.ts",
+      "--cwd",
+      path.join(root, "repos", "opencode", "packages", "opencode"),
+      "src/index.ts",
       "run",
       "--format",
       "json",

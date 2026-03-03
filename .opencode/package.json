@@ -4,6 +4,7 @@
   "type": "module",
   "dependencies": {
     "zod": "4.1.8",
-    "@opencode-ai/plugin": "1.2.15"
+    "@opencode-ai/plugin": "1.2.15",
+    "js-tiktoken": "1.0.21"
   }
 }

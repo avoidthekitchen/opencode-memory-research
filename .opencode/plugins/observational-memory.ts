@@ -3,6 +3,10 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import * as z from "zod/v4";
+import {
+  tokenCounter,
+  type MessageCountDiagnostics,
+} from "./token-counter.ts";
 
 const PLUGIN_ID = "observational-memory";
 const STATE_VERSION = 4;
@@ -411,6 +415,16 @@ type RuntimeStatus = {
   shouldPrune: boolean;
   continuationHint: boolean;
   requiredTool?: MaintenanceToolID;
+  promptDiagnostics?: {
+    transformedMessages: MessageCountDiagnostics;
+    injectedSystemTokens: number;
+    injectedMemoryTokens: number;
+    injectedTaskHintTokens: number;
+    injectedContinuationHintTokens: number;
+    injectedMaintenanceTokens: number;
+    injectedReminderTokens: number;
+    tokenizer: string;
+  };
 };
 
 type ObserveInput = {
@@ -615,7 +629,7 @@ export const ObservationalMemoryPlugin = async ({
           turnAnchorMessageID: output.message.id,
           atMs: Date.now(),
           text,
-          tokenEstimate: estimateTokens(text),
+          tokenEstimate: countStringTokens(text),
         });
         state.flags.maintenanceDeferred = false;
         state.runtime.continuationHint = false;
@@ -631,13 +645,14 @@ export const ObservationalMemoryPlugin = async ({
         const anchor = state.runtime.currentTurnAnchorMessageID;
         if (!anchor) return state;
         const text = truncateText(content, cfg.toolOutputChars);
+        const storedText = `${input.tool}: ${text}`;
         appendBufferItem(state, {
           kind: "tool",
           id: `${input.callID}:${hashText(text)}`,
           turnAnchorMessageID: anchor,
           atMs: Date.now(),
-          text: `${input.tool}: ${text}`,
-          tokenEstimate: estimateTokens(text),
+          text: storedText,
+          tokenEstimate: countStringTokens(storedText),
         });
         return state;
       });
@@ -670,7 +685,7 @@ export const ObservationalMemoryPlugin = async ({
             turnAnchorMessageID: info.parentID,
             atMs: info.time.completed ?? Date.now(),
             text,
-            tokenEstimate: estimateTokens(text),
+            tokenEstimate: countStringTokens(text),
           });
           return state;
         });
@@ -710,17 +725,29 @@ export const ObservationalMemoryPlugin = async ({
       const thresholds = resolveThresholds(config, DEFAULT_CONTEXT_LIMIT);
       evaluateFlags(state, thresholds);
       const requiredTool = selectMaintenanceTool(state);
+      const transformedMessages = tokenCounter.inspectMessages(output.messages);
       const prune = pruneMessages(
         output.messages,
         state,
         thresholds,
         requiredTool,
+        transformedMessages,
       );
       runtimeStatus.set(sessionID, {
         shouldInject: prune.shouldInject,
         shouldPrune: prune.pruned,
         continuationHint: prune.continuationHint,
         requiredTool,
+        promptDiagnostics: {
+          transformedMessages,
+          injectedSystemTokens: 0,
+          injectedMemoryTokens: 0,
+          injectedTaskHintTokens: 0,
+          injectedContinuationHintTokens: 0,
+          injectedMaintenanceTokens: 0,
+          injectedReminderTokens: 0,
+          tokenizer: tokenCounter.tokenizer,
+        },
       });
       if (prune.pruned) {
         output.messages.splice(0, output.messages.length, ...prune.messages);
@@ -750,41 +777,76 @@ export const ObservationalMemoryPlugin = async ({
         shouldPrune: false,
         continuationHint: false,
       };
+      let injectedMaintenanceTokens = 0;
+      let injectedMemoryTokens = 0;
+      let injectedTaskHintTokens = 0;
+      let injectedContinuationHintTokens = 0;
+      let injectedReminderTokens = 0;
 
       const requiredTool = selectMaintenanceTool(ready);
       if (requiredTool === "om_observe") {
-        output.system.push(renderObserveMaintenanceBlock(ready, config));
+        const block = renderObserveMaintenanceBlock(ready, config);
+        output.system.push(block);
+        injectedMaintenanceTokens += countStringTokens(block);
         runtime.shouldInject = false;
       } else if (requiredTool === "om_reflect") {
-        output.system.push(renderReflectMaintenanceBlock(ready));
+        const block = renderReflectMaintenanceBlock(ready);
+        output.system.push(block);
+        injectedMaintenanceTokens += countStringTokens(block);
         runtime.shouldInject = false;
       } else if (ready.memory.observations && !ready.flags.lockContention) {
-        output.system.push(renderOmBlock(ready.memory));
+        const block = renderOmBlock(ready.memory);
+        output.system.push(block);
+        injectedMemoryTokens += countStringTokens(block);
         runtime.shouldInject = true;
       } else if (
         (ready.memory.currentTask || ready.memory.suggestedResponse) &&
         !ready.flags.lockContention
       ) {
-        output.system.push(renderTaskHints(ready.memory));
+        const block = renderTaskHints(ready.memory);
+        output.system.push(block);
+        injectedTaskHintTokens += countStringTokens(block);
       }
 
       if (
         requiredTool &&
         (ready.memory.currentTask || ready.memory.suggestedResponse)
       ) {
-        output.system.push(renderTaskHints(ready.memory));
+        const block = renderTaskHints(ready.memory);
+        output.system.push(block);
+        injectedTaskHintTokens += countStringTokens(block);
       }
 
       if (runtime.continuationHint) {
-        output.system.push(renderContinuationHint());
+        const block = renderContinuationHint();
+        output.system.push(block);
+        injectedContinuationHintTokens += countStringTokens(block);
       }
       if (ready.flags.maintenanceDeferred && runtime.shouldInject === false) {
-        output.system.push(
-          "<system-reminder>Earlier context could not be refreshed this turn. Prefer the visible recent transcript.</system-reminder>",
-        );
+        const block =
+          "<system-reminder>Earlier context could not be refreshed this turn. Prefer the visible recent transcript.</system-reminder>";
+        output.system.push(block);
+        injectedReminderTokens += countStringTokens(block);
       }
 
       runtime.requiredTool = requiredTool;
+      runtime.promptDiagnostics = {
+        transformedMessages:
+          runtime.promptDiagnostics?.transformedMessages ??
+          tokenCounter.inspectMessages([]),
+        injectedSystemTokens:
+          injectedMaintenanceTokens +
+          injectedMemoryTokens +
+          injectedTaskHintTokens +
+          injectedContinuationHintTokens +
+          injectedReminderTokens,
+        injectedMemoryTokens,
+        injectedTaskHintTokens,
+        injectedContinuationHintTokens,
+        injectedMaintenanceTokens,
+        injectedReminderTokens,
+        tokenizer: tokenCounter.tokenizer,
+      };
       runtimeStatus.set(input.sessionID, runtime);
     },
   };
@@ -872,10 +934,6 @@ function emptyMemory() {
   };
 }
 
-function estimateTokens(text: string) {
-  return Math.ceil(text.length / 4);
-}
-
 function normalizeText(text: string | undefined) {
   return (text ?? "").replace(/\s+/g, " ").trim();
 }
@@ -925,12 +983,30 @@ function extractAssistantText(
   );
 }
 
-function renderMemoryForTokens(memory: OmStateV4["memory"]) {
-  return [
-    memory.observations,
-    memory.currentTask ?? "",
-    memory.suggestedResponse ?? "",
-  ].join("\n");
+function countStringTokens(text: string) {
+  return tokenCounter.countString(text);
+}
+
+function countInjectedMemoryTokens(memory: OmStateV4["memory"]) {
+  if (memory.observations) {
+    return countStringTokens(renderOmBlock(memory));
+  }
+  if (memory.currentTask || memory.suggestedResponse) {
+    return countStringTokens(renderTaskHints(memory));
+  }
+  return 0;
+}
+
+function refreshStateTokenEstimates(state: OmStateV4) {
+  state.buffer.items = state.buffer.items.map((item) => ({
+    ...item,
+    tokenEstimate: countStringTokens(item.text),
+  }));
+  state.buffer.tokenEstimateTotal = state.buffer.items.reduce(
+    (total, entry) => total + entry.tokenEstimate,
+    0,
+  );
+  state.memory.tokenEstimate = countInjectedMemoryTokens(state.memory);
 }
 
 function isOmTool(toolID: string) {
@@ -1112,9 +1188,7 @@ function runDeterministicObserve(
   state.memory.observations = merged;
   state.memory.currentTask = currentTask || undefined;
   state.memory.suggestedResponse = undefined;
-  state.memory.tokenEstimate = estimateTokens(
-    renderMemoryForTokens(state.memory),
-  );
+  state.memory.tokenEstimate = countInjectedMemoryTokens(state.memory);
   state.memory.updatedAtMs = Date.now();
   state.lastObserved.turnAnchorMessageID = completedAnchors.at(-1);
   state.lastObserved.atMs = observedItems[observedItems.length - 1]?.atMs;
@@ -1147,9 +1221,7 @@ function runDeterministicReflect(
     .filter(Boolean);
   const compacted = dedupeLines(lines).slice(-12);
   state.memory.observations = compacted.join("\n");
-  state.memory.tokenEstimate = estimateTokens(
-    renderMemoryForTokens(state.memory),
-  );
+  state.memory.tokenEstimate = countInjectedMemoryTokens(state.memory);
   state.memory.updatedAtMs = Date.now();
   state.stats.totalReflections += 1;
   state.flags.reflectRequired = false;
@@ -1237,9 +1309,7 @@ function applyObserveToolResult(
   );
   state.memory.currentTask = sanitized.currentTask;
   state.memory.suggestedResponse = sanitized.suggestedResponse;
-  state.memory.tokenEstimate = estimateTokens(
-    renderMemoryForTokens(state.memory),
-  );
+  state.memory.tokenEstimate = countInjectedMemoryTokens(state.memory);
   state.memory.updatedAtMs = Date.now();
   state.lastObserved.turnAnchorMessageID = anchorsToApply.at(-1);
   state.lastObserved.atMs = observedItems[observedItems.length - 1]?.atMs;
@@ -1293,7 +1363,17 @@ function applyReflectToolResult(
   // Validate compression
   // We expect the new observations to be smaller than the old ones, or at least smaller than the threshold
   // If not, we reject (unless we are already at max retry level 3, then we accept whatever we got)
-  const newTokens = estimateTokens(sanitized.observations);
+  const nextMemory = {
+    ...state.memory,
+    observations: sanitized.observations,
+    currentTask: sanitized.hasCurrentTask
+      ? sanitized.currentTask
+      : state.memory.currentTask,
+    suggestedResponse: sanitized.hasSuggestedResponse
+      ? sanitized.suggestedResponse
+      : state.memory.suggestedResponse,
+  };
+  const newTokens = countInjectedMemoryTokens(nextMemory);
   const targetThreshold = thresholds.reflectionThresholdTokens;
 
   if (state.stats.reflectFailures < 3 && newTokens > targetThreshold) {
@@ -1317,9 +1397,7 @@ function applyReflectToolResult(
   if (sanitized.hasSuggestedResponse) {
     state.memory.suggestedResponse = sanitized.suggestedResponse;
   }
-  state.memory.tokenEstimate = estimateTokens(
-    renderMemoryForTokens(state.memory),
-  );
+  state.memory.tokenEstimate = countInjectedMemoryTokens(state.memory);
   state.memory.updatedAtMs = Date.now();
   state.stats.totalReflections += 1;
   state.stats.reflectFailures = 0;
@@ -1593,7 +1671,7 @@ function buildObserveInput(state: OmStateV4, config: OmConfig): ObserveInput {
     lastIncludedAnchor,
     anchorCount: sections.length,
     itemCount,
-    tokenEstimate: estimateTokens(formatted),
+    tokenEstimate: countStringTokens(formatted),
   };
 }
 
@@ -1731,7 +1809,7 @@ function trimObservationGroups(
 
   while (
     working.length > 1 &&
-    (estimateTokens(renderObservationGroups(working)) > softTargetTokens ||
+    (countStringTokens(renderObservationGroups(working)) > softTargetTokens ||
       renderObservationGroups(working).length > config.maxObservationsChars ||
       countObservationLines(working) > MAX_OBSERVATION_LINES)
   ) {
@@ -1748,7 +1826,8 @@ function trimObservationGroups(
     }
     while (
       single.lines.length > 1 &&
-      (estimateTokens(renderObservationGroups(working)) > softTargetTokens ||
+      (countStringTokens(renderObservationGroups(working)) >
+        softTargetTokens ||
         renderObservationGroups(working).length > config.maxObservationsChars)
     ) {
       single.lines.shift();
@@ -1929,6 +2008,7 @@ function pruneMessages(
   state: OmStateV4,
   thresholds: Thresholds,
   requiredTool?: MaintenanceToolID,
+  transformedMessages = tokenCounter.inspectMessages(messages),
 ) {
   if (requiredTool || state.flags.maintenanceDeferred) {
     return {
@@ -1995,7 +2075,7 @@ function pruneMessages(
     };
   }
 
-  const currentTokens = estimateTokens(JSON.stringify(messages));
+  const currentTokens = transformedMessages.tokens;
   if (currentTokens <= thresholds.rawMessageBudgetTokens) {
     return {
       messages,
@@ -2035,8 +2115,10 @@ function resolveThresholds(config: OmConfig, contextLimit: number): Thresholds {
 
 function statusPayload(state: OmStateV4, config: OmConfig) {
   const thresholds = resolveThresholds(config, DEFAULT_CONTEXT_LIMIT);
+  refreshStateTokenEstimates(state);
   evaluateFlags(state, thresholds);
   const observeInput = buildObserveInput(state, config);
+  const promptDiagnostics = runtimeStatus.get(state.sessionID)?.promptDiagnostics;
   return {
     sessionID: state.sessionID,
     mode: config.mode,
@@ -2053,6 +2135,32 @@ function statusPayload(state: OmStateV4, config: OmConfig) {
       observeInputAnchors: observeInput.anchorCount,
       observeInputTokens: observeInput.tokenEstimate,
       lockContention: !!state.flags.lockContention,
+      diagnostics: {
+        tokenizer: promptDiagnostics?.tokenizer ?? tokenCounter.tokenizer,
+        transformedMessageTokens:
+          promptDiagnostics?.transformedMessages.tokens ?? 0,
+        transformedCountedMessages:
+          promptDiagnostics?.transformedMessages.countedMessages ?? 0,
+        transformedSkippedMessages:
+          promptDiagnostics?.transformedMessages.skippedMessages ?? 0,
+        countedPromptParts:
+          promptDiagnostics?.transformedMessages.countedParts ?? 0,
+        skippedPromptParts:
+          promptDiagnostics?.transformedMessages.skippedParts ?? 0,
+        injectedSystemTokens: promptDiagnostics?.injectedSystemTokens ?? 0,
+        injectedMemoryTokens:
+          promptDiagnostics?.injectedMemoryTokens ??
+          countInjectedMemoryTokens(state.memory),
+        injectedTaskHintTokens:
+          promptDiagnostics?.injectedTaskHintTokens ??
+          countStringTokens(renderTaskHints(state.memory)),
+        injectedContinuationHintTokens:
+          promptDiagnostics?.injectedContinuationHintTokens ?? 0,
+        injectedMaintenanceTokens:
+          promptDiagnostics?.injectedMaintenanceTokens ?? 0,
+        injectedReminderTokens:
+          promptDiagnostics?.injectedReminderTokens ?? 0,
+      },
     },
     stats: {
       totalObservedItems: state.stats.totalObservedItems,
@@ -2131,7 +2239,9 @@ async function withState(
     return state;
   }
   try {
+    refreshStateTokenEstimates(state);
     const next = await mutate(state, config);
+    refreshStateTokenEstimates(next);
     next.flags.lockContention = false;
     next.generation += 1;
     await writeState(directory, next);
@@ -2150,6 +2260,7 @@ async function loadState(sessionID: string, directory: string) {
     const text = await fs.readFile(file, "utf8");
     const parsed = JSON.parse(text);
     const state = migrateState(sessionID, parsed);
+    refreshStateTokenEstimates(state);
     cache.set(sessionID, state);
     return state;
   } catch {
