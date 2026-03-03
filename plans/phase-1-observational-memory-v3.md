@@ -9,8 +9,8 @@ Supersedes: `plans/phase-1-observational-memory-v2.md` for the recommended Phase
 Implement **Option 2 / "mini-B"** as the Phase 1 default for an OpenCode plugin:
 
 - Maintain explicit **observational memory (OM)** per **session**.
-- Evaluate **observe** and **reflect** thresholds before every LLM call.
-- Use synchronous internal tools, `om.observe` and `om.reflect`, to update OM before answering when needed.
+- Evaluate **observe** and **reflect** thresholds before every outer assistant LLM step (`LLM.stream` invocation).
+- Use synchronous internal tools, `om_observe` and `om_reflect`, to update OM before answering when needed.
 - Keep the prompt bounded by injecting an OM system block and pruning older observed raw history.
 - Preserve user trust by emitting visible maintenance status while synchronous OM work is happening.
 
@@ -22,6 +22,14 @@ This remains intentionally simpler than full Mastra OM:
 - no cross-session or per-repo OM in Phase 1
 
 Goal: capture most of the **behavioral** benefits of OM without requiring OpenCode core changes.
+
+## Implementation TODO Status
+
+- [x] Revise the Phase 1 plan text to reflect implementation-safe tool IDs, outer-step trigger semantics, and explicit status signaling.
+- [x] Create the project-local plugin scaffold under `.opencode/plugins/` with dependency/config support needed for loading.
+- [x] Implement OM state storage, buffering, maintenance tools, and prompt/pruning hooks.
+- [x] Validate plugin loading and core behavior paths with focused local checks.
+- [x] Document run/try instructions and mark final implementation status.
 
 ---
 
@@ -61,8 +69,8 @@ Locked scope rule:
 - **Scope:** per-session OM only in Phase 1.
 - **Baseline:** target the pinned OpenCode and Mastra SHAs above.
 - **Storage:** plugin-owned local state outside the repo.
-- **Trigger point:** evaluate OM before every LLM call.
-- **Maintenance model:** synchronous `om.observe` / `om.reflect` tools.
+- **Trigger point:** evaluate OM before every outer assistant LLM step (`LLM.stream` invocation).
+- **Maintenance model:** synchronous `om_observe` / `om_reflect` tools.
 - **Prompt model:** inject OM every turn; prune only when OM is current.
 - **Compaction policy:** native OpenCode compaction remains enabled as an emergency fallback, not the primary OM mechanism.
 - **Pruning floor:** never prune the protected "tip-of-spear" window.
@@ -88,6 +96,8 @@ Rules:
 
 - Status signaling must happen before the maintenance tool call begins.
 - Status signaling must also happen on maintenance failure or deferral.
+- Phase 1 default status channel: plugin operational logs via `client.app.log()`, plus tool `title` / `metadata` updates while `om_*` tools are running.
+- For deferral cases where no `om_*` tool actually runs, a plugin log entry is sufficient; do not force assistant prose just to surface maintenance state.
 - These signals are operational UI/log output, not user-facing assistant prose.
 
 ### 2) Strict Tip-of-Spear Protection
@@ -127,9 +137,9 @@ Validation:
    - finalized assistant text
    - truncated tool outcomes
 
-2. Before each LLM call:
-   - if unobserved content exceeds the observation threshold, require `om.observe`
-   - else if OM content exceeds the reflection threshold, require `om.reflect`
+2. Before each outer assistant LLM step (`LLM.stream` invocation):
+   - if unobserved content exceeds the observation threshold, require `om_observe`
+   - else if OM content exceeds the reflection threshold, require `om_reflect`
    - else inject OM normally
 
 3. When OM is current:
@@ -150,7 +160,7 @@ Validation:
 - `event` for finalized assistant output
 - `experimental.chat.system.transform` for OM injection and maintenance instructions
 - `experimental.chat.messages.transform` for raw-tail pruning and continuation hint
-- `tool` for `om.observe`, `om.reflect`, `om.status`, `om.export`, `om.forget`
+- `tool` for `om_observe`, `om_reflect`, `om_status`, `om_export`, `om_forget`
 
 ---
 
@@ -216,7 +226,7 @@ Phase 1 is synchronous, but it must not spin indefinitely or silently hang.
 When maintenance is required:
 
 - emit a maintenance status signal
-- inject an explicit system rule: "Before answering, call `om.observe`." or "Before answering, call `om.reflect`."
+- inject an explicit system rule: "Before answering, call `om_observe`." or "Before answering, call `om_reflect`."
 - strengthen the tool description for the required tool on that turn
 
 ### Attempt limits
@@ -251,6 +261,7 @@ If OM is hard overdue:
 Implementation gate:
 
 - If the pinned OpenCode plugin API cannot safely restart a turn after a non-compliant answer, do not fake hidden retries. In that case, use the "defer and skip pruning" path above.
+- Phase 1 locked interpretation of "before every LLM call": evaluate at each outer assistant step (`LLM.stream` invocation), not at provider-internal sub-calls inside a single streamed tool-use loop.
 
 ---
 
@@ -266,7 +277,7 @@ These are the Phase 1 defaults and should be treated as the implementation contr
 
 Operational ordering:
 
-- if both thresholds are exceeded, run `om.observe` first, then `om.reflect` on the next loop iteration
+- if both thresholds are exceeded, run `om_observe` first, then `om_reflect` on the next loop iteration
 - prefer `reflect` before `observe` only when OM itself is oversized and the unobserved buffer is too small to justify delaying compression
 
 ### Hard-overdue thresholds
@@ -520,7 +531,7 @@ Optional JSON config locations:
 
 ## Tool Policy
 
-### `om.observe`
+### `om_observe`
 
 Purpose:
 
@@ -533,7 +544,7 @@ Tool behavior:
 - advance `lastObserved.turnAnchorMessageID`
 - clear the buffer
 
-### `om.reflect`
+### `om_reflect`
 
 Purpose:
 
@@ -545,7 +556,7 @@ Tool behavior:
 - update `memory.tokenEstimate`
 - increment reflection stats
 
-### `om.status`
+### `om_status`
 
 Must expose:
 
@@ -554,14 +565,14 @@ Must expose:
 - maintenance deferral counts
 - lock contention state
 
-### `om.export`
+### `om_export`
 
 Locked default:
 
 - export full OM content only when explicitly requested
 - no automatic background export
 
-### `om.forget`
+### `om_forget`
 
 Locked default:
 
@@ -606,3 +617,49 @@ This sequence keeps the architecture simple while resolving the highest-risk cor
 - semantic recall or working memory
 
 Those remain later phases after the synchronous session-scoped OM path is validated.
+
+---
+
+## Implementation Status
+
+Implementation note (2026-03-03): the first runnable plugin now lives at `.opencode/plugins/observational-memory.ts`, with local dependency support in `.opencode/package.json` and project defaults in `.opencode/observational-memory.json`.
+
+Implementation note (2026-03-03): `om_observe` and `om_reflect` currently use a deterministic local digest/compression pass rather than a separate model-backed summarization call. This keeps Phase 1 synchronous and self-contained within current OpenCode plugin constraints.
+
+## Try It
+
+1. Run OpenCode from the repo root so it loads the local `.opencode/plugins/` directory.
+2. If OpenCode does not auto-install local plugin dependencies in `.opencode/`, run `npm install` in `.opencode/`.
+3. Start or continue a long session in this repo. The plugin will auto-capture user messages, finalized assistant text, and truncated tool output for that session.
+4. Manual tools are available for inspection and control: `om_status`, `om_export`, `om_observe`, `om_reflect`, `om_forget`.
+5. Optional overrides:
+   `OPENCODE_OM_ENABLED`
+   `OPENCODE_OM_OBSERVE_TOKENS`
+   `OPENCODE_OM_REFLECT_TOKENS`
+   `OPENCODE_OM_RAW_BUDGET_TOKENS`
+   `OPENCODE_OM_TOOL_OUTPUT_CHARS`
+   `OPENCODE_OM_STATE_DIR`
+6. Smoke test helpers:
+   `node --experimental-strip-types scripts/smoke-om-plugin.mjs`
+   `node --experimental-strip-types scripts/smoke-om-plugin.mjs --opencode`
+
+## Validation Notes
+
+Validated locally on 2026-03-03 by:
+
+- importing the plugin module directly under Node 25 with `--experimental-strip-types`
+- initializing the plugin and confirming all expected hooks and tools are exported
+- mocking `chat.message`, `tool.execute.after`, `message.updated`, and the chat transform hooks to verify state capture, OM block injection, and protected-tail pruning behavior
+- running `scripts/smoke-om-plugin.mjs` successfully in plugin mode after correcting the plugin schema version mismatch to Zod 4
+
+---
+
+## Minor Issues (Non-Blocking)
+
+Review note (2026-03-03): these items should not block a first-pass implementation, but should be cleaned up during or immediately after Phase 1.
+
+- The current runnable plugin uses deterministic local observe/reflect heuristics rather than model-backed summarization; quality tuning for very noisy sessions is still open.
+- Dynamic per-turn strengthening of tool descriptions is not implemented, because the current `tool.definition` hook does not carry session context.
+- Prompt budgeting still uses coarse `chars / 4` estimation rather than provider-accurate tokenization.
+- Tool attachments (images/files) are not buffered into OM; only textual tool output is currently digested.
+- Validation is hook-level and mocked, not yet an end-to-end OpenCode session run against a live model.

@@ -1,0 +1,8 @@
+{
+  "enabled": true,
+  "observeThresholdTokens": 30000,
+  "reflectThresholdTokens": 40000,
+  "rawMessageBudgetTokens": 32000,
+  "toolOutputChars": 2000,
+  "stateDir": ""
+}
