@@ -7,20 +7,56 @@ This is a **research repository** for studying memory integration strategies bet
 - The research document in `research/opencode-mastra-memory.md`
 - Planning documents in `plans/` that turn the research into implementation options and phased proposals
 
-This is **not a coding project** - there is no build system, tests, or executable code. The `repos/` directory is only for optional local reference clones used during research verification.
+This is primarily a **research repository**. There is no conventional app build/test pipeline for this repo itself. The `repos/` directory is only for optional local reference clones used during research verification.
+
+Exception:
+
+- There is now a project-local OpenCode plugin prototype under `.opencode/plugins/observational-memory.ts`
+- There is also a focused smoke script at `scripts/smoke-om-plugin.mjs`
+- These exist only to validate the observational-memory plan and plugin behavior; they are not a general repo-wide build/test system
 
 ---
 
 ## No Build/Lint/Test Commands
 
-This repository contains only Markdown documentation. There are no:
+This repository does not have a normal build/lint/test pipeline. There are no repo-wide:
 
 - Build commands
 - Lint commands  
 - Test commands
-- Package managers (npm, pnpm, yarn, cargo, etc.)
+- Package managers for the repository as a whole (npm, pnpm, yarn, cargo, etc.)
 
-**Do not attempt to run build, lint, or test commands** - they will not work.
+**Do not invent generic build, lint, or test commands** - they will not work.
+
+Allowed exception for the local OM plugin prototype:
+
+- `.opencode/package.json` may be used for local plugin dependency installation only
+- `scripts/smoke-om-plugin.mjs` may be used as the primary smoke test
+- If `bun` is available locally, the smoke script may also be used in `--opencode` mode to try a real OpenCode CLI run against `repos/opencode`
+
+### How To Test Things
+
+If you are working on the local observational-memory plugin prototype, use these checks:
+
+1. Install local plugin dependencies if needed:
+   - `cd .opencode && npm install`
+2. Run the plugin smoke test:
+   - `node --experimental-strip-types scripts/smoke-om-plugin.mjs`
+3. If `bun` is installed and you want a fuller CLI smoke check:
+   - `node --experimental-strip-types scripts/smoke-om-plugin.mjs --opencode`
+4. For manual verification, run OpenCode from the repo root and ask it to call:
+   - `om_status`
+   - `om_export`
+   - `om_observe`
+   - `om_reflect`
+   - `om_forget`
+
+Validation expectations:
+
+- Prefer the smoke script over ad hoc commands
+- Treat the Node smoke script as the minimum required check after plugin edits
+- If `bun` is unavailable, note that the full OpenCode CLI smoke path could not be run
+- Do not add unrelated test tooling to the repo just to validate this plugin
 
 ---
 

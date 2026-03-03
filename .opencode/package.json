@@ -1,0 +1,9 @@
+{
+  "name": "opencode-memory-research-local-plugins",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "zod": "4.1.8",
+    "@opencode-ai/plugin": "1.2.15"
+  }
+}
