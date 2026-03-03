@@ -1,6 +1,6 @@
 # OpenCode Memory Research
 
-This repository is a research and prototyping workspace for adding Mastra-style memory behavior to OpenCode, with a current focus on Phase 1 observational memory.
+This repository is a research and prototyping workspace for adding Mastra-style memory behavior to OpenCode, with a current focus on Phase 1 Observational Memory. Phase 1's main gap is that observe and reflect are synchronous for simplicity, so means this does add addititional latency to responses for the sake of testing the performance of Observational Memory context management's theory. 
 
 ## What Lives Here
 
