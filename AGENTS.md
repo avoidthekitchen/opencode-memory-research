@@ -44,7 +44,12 @@ If you are working on the local observational-memory plugin prototype, use these
    - `node --experimental-strip-types scripts/smoke-om-plugin.mjs`
 3. If `bun` is installed and you want a fuller CLI smoke check:
    - `node --experimental-strip-types scripts/smoke-om-plugin.mjs --opencode`
-4. For manual verification, run OpenCode from the repo root and ask it to call:
+4. Inspect current observational-memory state directly when needed:
+   - `node --experimental-strip-types scripts/om-status.mjs <session-id>`
+5. If you want to copy or refresh the plugin in another repository, use:
+   - `./setup-om-plugin.sh /path/to/target-repo`
+   - `./update-om-plugin.sh /path/to/target-repo`
+6. For manual verification, run OpenCode from the repo root and ask it to call:
    - `om_status`
    - `om_export`
    - `om_observe`

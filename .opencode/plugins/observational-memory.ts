@@ -171,8 +171,8 @@ export const ObservationalMemoryPlugin = async ({
         description: "Show observational memory status, thresholds, and current estimates for this session.",
         args: {},
         async execute(_args, context) {
-          const state = await loadState(context.sessionID, directory)
-          return JSON.stringify(statusPayload(state, await getConfig(directory)), null, 2)
+          const { status } = await readOmStatus(context.sessionID, directory)
+          return JSON.stringify(status, null, 2)
         },
       }),
       om_export: defineTool({
@@ -693,6 +693,18 @@ function statusPayload(state: OmStateV3, config: OmConfig) {
       maintenanceDeferredTurns: state.stats.maintenanceDeferredTurns,
       lockContention: !!state.flags.lockContention,
     },
+  }
+}
+
+export async function readOmStatus(sessionID: string, directory: string) {
+  const [state, config, statePath] = await Promise.all([
+    loadState(sessionID, directory),
+    getConfig(directory),
+    sessionStatePath(directory, sessionID),
+  ])
+  return {
+    status: statusPayload(state, config),
+    statePath,
   }
 }
 

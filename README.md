@@ -26,6 +26,7 @@ The repository has four layers:
 4. Local prototype
    `.opencode/plugins/observational-memory.ts`
    `.opencode/observational-memory.json`
+   `scripts/om-status.mjs`
    `scripts/smoke-om-plugin.mjs`
 
    This is the first runnable implementation of the Phase 1 plan. It is intentionally small and local to this repository so the design can be exercised before moving to a dedicated plugin repository or a fork.
@@ -51,6 +52,7 @@ opencode-memory-research/
 │   └── plugins/
 │       └── observational-memory.ts
 └── scripts/
+    ├── om-status.mjs
     └── smoke-om-plugin.mjs
 ```
 
@@ -118,6 +120,25 @@ The current prototype exposes these tools:
 
 In this first pass, `om_observe` and `om_reflect` use deterministic local digest/compression logic instead of a separate model-backed summarization call. That choice keeps the prototype synchronous, self-contained, and compatible with the existing plugin API surface.
 
+## Inspect Current Observational Memory
+
+If you want to inspect the current observational-memory status without asking the agent to call `om_status`, use the local helper script:
+
+`node --experimental-strip-types scripts/om-status.mjs <session-id>`
+
+You can also use the explicit flag form:
+
+`node --experimental-strip-types scripts/om-status.mjs --session <session-id>`
+
+The script prints a compact summary including:
+
+- whether the session state file exists
+- buffered-token and memory-token estimates
+- the last observed turn anchor
+- maintenance deferral and lock-contention flags
+- the resolved threshold values
+- the state file path being read
+
 ## Why The Architecture Looks Like This
 
 The repo is structured to keep three concerns separate:
@@ -143,8 +164,27 @@ If you want to exercise the prototype:
    `node --experimental-strip-types scripts/smoke-om-plugin.mjs`
 3. If `bun` is installed and you want a fuller CLI smoke check:
    `node --experimental-strip-types scripts/smoke-om-plugin.mjs --opencode`
-4. Run OpenCode from the repo root and explicitly ask it to call:
+4. Inspect the current observational-memory state directly:
+   `node --experimental-strip-types scripts/om-status.mjs <session-id>`
+5. Run OpenCode from the repo root and explicitly ask it to call:
    `om_status`
+
+## Install Or Update In Another Repository
+
+If you want to copy this plugin prototype into another repository, use the installer scripts in this repo root:
+
+- `./setup-om-plugin.sh /path/to/target-repo`
+- `./update-om-plugin.sh /path/to/target-repo`
+
+The setup script installs or merges:
+
+- `.opencode/plugins/observational-memory.ts`
+- `.opencode/observational-memory.json`
+- `.opencode/package.json` dependencies for the plugin
+- `scripts/om-status.mjs`
+- `scripts/smoke-om-plugin.mjs`
+
+The update script is a thin wrapper that runs setup in overwrite mode for plugin files while still preserving an existing project config unless you explicitly approve replacing it.
 
 The smoke script is the preferred validation path documented in `AGENTS.md`.
 
@@ -156,6 +196,7 @@ The only executable pieces that should be treated as supported local validation 
 
 - `.opencode/package.json` for plugin-local dependencies
 - `.opencode/plugins/observational-memory.ts` for the local plugin prototype
+- `scripts/om-status.mjs` for direct local status inspection
 - `scripts/smoke-om-plugin.mjs` for smoke testing
 
 If the prototype continues to prove out, the likely next step is to move the implementation to a dedicated plugin repository or a maintained OpenCode fork.
