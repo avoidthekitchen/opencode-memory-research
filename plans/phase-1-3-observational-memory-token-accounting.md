@@ -38,6 +38,12 @@ First-pass implementation status in this repo:
 - [x] Extend the focused smoke script with token-accounting checks and run the plugin-local smoke validation successfully on March 3, 2026.
 - [x] Run the optional full `--opencode` smoke path cleanly. On March 3, 2026 this passed after updating the smoke launcher to execute from `repos/opencode/packages/opencode`, which makes Bun use the package-local Solid JSX config instead of the workspace root config.
 
+## Verification Status
+
+- [x] Focused plugin smoke validation passed via `node --experimental-strip-types scripts/smoke-om-plugin.mjs` on March 3, 2026.
+- [x] OpenCode-backed smoke validation passed via `node --experimental-strip-types scripts/smoke-om-plugin.mjs --opencode` on March 3, 2026.
+- [x] The smoke coverage exercises tokenized comparisons for prose, code, JSON/tool payloads, stack traces, hidden metadata exclusion, and prompt-visible message counting.
+
 ---
 
 ## Goals

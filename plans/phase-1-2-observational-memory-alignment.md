@@ -53,4 +53,12 @@ Phase 1.1 introduced LLM-driven extraction, but research shows the prompts and f
     - Verify state updates and failure count clears.
 3.  **Observation Quality:** Run a short session with complex user assertions ("I'm moving from X to Y next week") and verify the extracted observation captures the specific "moving" verb and dates per Mastra's examples.
 
-**Status:** Complete. Plugin aligned with Mastra v0.1.0-alpha.
+## Verification Status
+
+- [x] Observer prompt now injects `OBSERVER_GUIDELINES` alongside the full extraction instructions and output format.
+- [x] Reflection retry validation now rejects non-reducing outputs as well as over-threshold outputs until retry level 3.
+- [x] `om_reflect` now clears stale `currentTask` / `suggestedResponse` values when those fields are omitted.
+- [x] Focused plugin smoke validation passed via `node --experimental-strip-types scripts/smoke-om-plugin.mjs` on March 3, 2026.
+- [x] Full OpenCode CLI smoke validation passed via `node --experimental-strip-types scripts/smoke-om-plugin.mjs --opencode` on March 3, 2026.
+
+**Status:** Complete. Plugin aligned with Mastra v0.1.0-alpha and verified by both focused and OpenCode-backed smoke paths on March 3, 2026.
