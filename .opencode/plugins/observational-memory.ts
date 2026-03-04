@@ -355,6 +355,13 @@ Your current detail level was a 10/10, lets aim for a 4/10 detail level.
 type BufferKind = "user" | "assistant" | "tool";
 type MaintenanceToolID = "om_observe" | "om_reflect";
 type ScopeMode = "session" | "project" | "global";
+type AssistantEventReason =
+  | "captured"
+  | "missing-completed"
+  | "summary"
+  | "message-missing"
+  | "empty-text"
+  | "duplicate";
 
 type ThresholdRange = {
   min?: number;
@@ -402,6 +409,15 @@ type OmStateV5 = {
     reflectFailures: number;
     maintenanceDeferredTurns: number;
     recoveryCaptures: number;
+    lockContentionSkips: number;
+    assistantEventsSeen: number;
+    assistantEventsCaptured: number;
+    assistantEventsDropped: number;
+    assistantDropMissingCompleted: number;
+    assistantDropSummary: number;
+    assistantDropMessageMissing: number;
+    assistantDropEmptyText: number;
+    assistantDropDuplicate: number;
   };
   flags: {
     observeRequired?: boolean;
@@ -418,6 +434,13 @@ type OmStateV5 = {
     maintenancePromptIssued?: boolean;
     pendingMaintenanceTool?: MaintenanceToolID;
     observeCursorHint?: string;
+    lastAssistantEventReason?: AssistantEventReason;
+    lastAssistantEventMessageID?: string;
+    lastAssistantEventAtMs?: number;
+    lastAssistantEventCompleted?: boolean;
+    lastAssistantEventSummary?: boolean;
+    lastAssistantEventTextChars?: number;
+    lastLockContentionAtMs?: number;
   };
 };
 
@@ -551,7 +574,9 @@ export const ObservationalMemoryPlugin = async ({
       }) => Promise<unknown>;
     };
     session: {
-      message: (options: { sessionID: string; messageID: string }) => Promise<{
+      message: (options: {
+        path: { id: string; messageID: string };
+      }) => Promise<{
         data?: {
           parts: Array<{
             type?: string;
@@ -725,22 +750,102 @@ export const ObservationalMemoryPlugin = async ({
       if (event.type === "message.updated") {
         const info = event.properties.info;
         if (info.role !== "assistant") return;
-        if (!info.time.completed) return;
-        if (info.summary) return;
+
+        if (!info.time.completed) {
+          await withState(info.sessionID, directory, async (state) => {
+            recordAssistantEvent(state, {
+              reason: "missing-completed",
+              messageID: info.id,
+              completed: false,
+              summary: !!info.summary,
+            });
+            return state;
+          });
+          await log(client, "debug", "Assistant event skipped", {
+            sessionID: info.sessionID,
+            messageID: info.id,
+            reason: "missing-completed",
+          });
+          return;
+        }
+
+        if (info.summary) {
+          await withState(info.sessionID, directory, async (state) => {
+            recordAssistantEvent(state, {
+              reason: "summary",
+              messageID: info.id,
+              completed: true,
+              summary: true,
+            });
+            return state;
+          });
+          await log(client, "debug", "Assistant event skipped", {
+            sessionID: info.sessionID,
+            messageID: info.id,
+            reason: "summary",
+          });
+          return;
+        }
+
         const response = await client.session.message({
-          sessionID: info.sessionID,
-          messageID: info.id,
+          path: {
+            id: info.sessionID,
+            messageID: info.id,
+          },
         });
         const message = response.data;
-        if (!message) return;
+        if (!message) {
+          await withState(info.sessionID, directory, async (state) => {
+            recordAssistantEvent(state, {
+              reason: "message-missing",
+              messageID: info.id,
+              completed: true,
+              summary: false,
+            });
+            return state;
+          });
+          await log(client, "warn", "Assistant event missing message payload", {
+            sessionID: info.sessionID,
+            messageID: info.id,
+            reason: "message-missing",
+          });
+          return;
+        }
+
         const text = extractAssistantText(message.parts);
-        if (!text) return;
+        if (!text) {
+          await withState(info.sessionID, directory, async (state) => {
+            recordAssistantEvent(state, {
+              reason: "empty-text",
+              messageID: info.id,
+              completed: true,
+              summary: false,
+              textChars: 0,
+            });
+            return state;
+          });
+          await log(client, "debug", "Assistant event produced empty text", {
+            sessionID: info.sessionID,
+            messageID: info.id,
+            reason: "empty-text",
+            partCount: message.parts.length,
+          });
+          return;
+        }
+
         await withState(info.sessionID, directory, async (state) => {
           if (
             state.buffer.items.some(
               (item) => item.kind === "assistant" && item.id === info.id,
             )
           ) {
+            recordAssistantEvent(state, {
+              reason: "duplicate",
+              messageID: info.id,
+              completed: true,
+              summary: false,
+              textChars: text.length,
+            });
             return state;
           }
           appendBufferItem(state, {
@@ -750,6 +855,13 @@ export const ObservationalMemoryPlugin = async ({
             atMs: info.time.completed ?? Date.now(),
             text,
             tokenEstimate: 0,
+          });
+          recordAssistantEvent(state, {
+            reason: "captured",
+            messageID: info.id,
+            completed: true,
+            summary: false,
+            textChars: text.length,
           });
           return state;
         });
@@ -964,6 +1076,15 @@ function createEmptyState(
       reflectFailures: 0,
       maintenanceDeferredTurns: 0,
       recoveryCaptures: 0,
+      lockContentionSkips: 0,
+      assistantEventsSeen: 0,
+      assistantEventsCaptured: 0,
+      assistantEventsDropped: 0,
+      assistantDropMissingCompleted: 0,
+      assistantDropSummary: 0,
+      assistantDropMessageMissing: 0,
+      assistantDropEmptyText: 0,
+      assistantDropDuplicate: 0,
     },
     flags: {},
     runtime: {},
@@ -1204,6 +1325,49 @@ function appendBufferItem(state: OmStateV5, item: BufferItem) {
     (total, entry) => total + entry.tokenEstimate,
     0,
   );
+}
+
+function recordAssistantEvent(
+  state: OmStateV5,
+  input: {
+    reason: AssistantEventReason;
+    messageID: string;
+    completed: boolean;
+    summary: boolean;
+    textChars?: number;
+  },
+) {
+  state.stats.assistantEventsSeen += 1;
+  state.runtime.lastAssistantEventReason = input.reason;
+  state.runtime.lastAssistantEventMessageID = input.messageID;
+  state.runtime.lastAssistantEventAtMs = Date.now();
+  state.runtime.lastAssistantEventCompleted = input.completed;
+  state.runtime.lastAssistantEventSummary = input.summary;
+  state.runtime.lastAssistantEventTextChars = input.textChars ?? 0;
+
+  if (input.reason === "captured") {
+    state.stats.assistantEventsCaptured += 1;
+    return;
+  }
+
+  state.stats.assistantEventsDropped += 1;
+  if (input.reason === "missing-completed") {
+    state.stats.assistantDropMissingCompleted += 1;
+    return;
+  }
+  if (input.reason === "summary") {
+    state.stats.assistantDropSummary += 1;
+    return;
+  }
+  if (input.reason === "message-missing") {
+    state.stats.assistantDropMessageMissing += 1;
+    return;
+  }
+  if (input.reason === "empty-text") {
+    state.stats.assistantDropEmptyText += 1;
+    return;
+  }
+  state.stats.assistantDropDuplicate += 1;
 }
 
 async function ensureMemoryReady(
@@ -2583,6 +2747,28 @@ function statusPayload(state: OmStateV5, config: OmConfig, sessionID = state.ses
       shareTokenBudget: thresholds.shareTokenBudget,
       sharedBudgetTokens: thresholds.sharedBudgetTokens,
       lockContention: !!state.flags.lockContention,
+      lockContentionSkips: state.stats.lockContentionSkips,
+      lastLockContentionAtMs: state.runtime.lastLockContentionAtMs,
+      assistantCapture: {
+        seen: state.stats.assistantEventsSeen,
+        captured: state.stats.assistantEventsCaptured,
+        dropped: state.stats.assistantEventsDropped,
+        dropReasons: {
+          missingCompleted: state.stats.assistantDropMissingCompleted,
+          summary: state.stats.assistantDropSummary,
+          messageMissing: state.stats.assistantDropMessageMissing,
+          emptyText: state.stats.assistantDropEmptyText,
+          duplicate: state.stats.assistantDropDuplicate,
+        },
+        lastEvent: {
+          reason: state.runtime.lastAssistantEventReason,
+          messageID: state.runtime.lastAssistantEventMessageID,
+          atMs: state.runtime.lastAssistantEventAtMs,
+          completed: state.runtime.lastAssistantEventCompleted,
+          summary: state.runtime.lastAssistantEventSummary,
+          textChars: state.runtime.lastAssistantEventTextChars,
+        },
+      },
       diagnostics: {
         tokenizer: promptDiagnostics?.tokenizer ?? tokenCounter.tokenizer,
         transformedMessageTokens:
@@ -2614,6 +2800,10 @@ function statusPayload(state: OmStateV5, config: OmConfig, sessionID = state.ses
       observeFailures: state.stats.observeFailures,
       reflectFailures: state.stats.reflectFailures,
       maintenanceDeferredTurns: state.stats.maintenanceDeferredTurns,
+      lockContentionSkips: state.stats.lockContentionSkips,
+      assistantEventsSeen: state.stats.assistantEventsSeen,
+      assistantEventsCaptured: state.stats.assistantEventsCaptured,
+      assistantEventsDropped: state.stats.assistantEventsDropped,
     },
   };
 }
@@ -2682,6 +2872,8 @@ async function withState(
   const lock = await acquireLock(sessionID, directory);
   if (!lock.acquired) {
     state.flags.lockContention = true;
+    state.stats.lockContentionSkips += 1;
+    state.runtime.lastLockContentionAtMs = Date.now();
     cache.set(scope.key, state);
     if (onLockContention) await onLockContention();
     return state;
