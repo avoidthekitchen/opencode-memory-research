@@ -20,13 +20,13 @@ Non-goal: implement Mastra’s async buffering (`bufferTokens`, `bufferActivatio
 
 ## Implementation TODO Status (Master Checklist)
 
-- [ ] Phase 1: Make pruning Mastra-like (drop observed history, keep bounded tail)
-- [ ] Phase 2: Make Actor injection Mastra-like (context prompt + instructions + continuation hint, optional relative-time annotations)
-- [ ] Phase 3: Make Observer input formatting Mastra-like (message formatting + tool call/result encoding)
-- [ ] Phase 4: Close remaining behavioral gaps (config parity + optional scope mapping) without async buffering
-- [ ] Run `node --experimental-strip-types scripts/smoke-om-plugin.mjs` after each phase
+- [x] Phase 1: Make pruning Mastra-like (drop observed history, keep bounded tail)
+- [x] Phase 2: Make Actor injection Mastra-like (context prompt + instructions + continuation hint, optional relative-time annotations)
+- [x] Phase 3: Make Observer input formatting Mastra-like (message formatting + tool call/result encoding)
+- [x] Phase 4: Close remaining behavioral gaps (config parity + optional scope mapping) without async buffering
+- [x] Run `node --experimental-strip-types scripts/smoke-om-plugin.mjs` after each phase
 
-Status: planned (do not implement until explicitly approved).
+Status: completed.
 
 ## Baseline (Pinned)
 
@@ -99,11 +99,11 @@ Make pruning **state-driven**, not “only when the prompt is too large”:
 
 ### Phase 1 TODO Checklist
 
-- [ ] Add a config knob for “tail retention” (user turns or tokens) distinct from `rawMessageBudgetTokens`
-- [ ] Change pruning so observed history is pruned whenever OM is “ready”, not only when over budget
-- [ ] Ensure pruning stays disabled while maintenance is required/deferred
-- [ ] Ensure continuation hint is injected only when pruning actually removed older context
-- [ ] Update `om_status` to report tail retention settings + effective cutoff
+- [x] Add a config knob for “tail retention” (user turns or tokens) distinct from `rawMessageBudgetTokens`
+- [x] Change pruning so observed history is pruned whenever OM is “ready”, not only when over budget
+- [x] Ensure pruning stays disabled while maintenance is required/deferred
+- [x] Ensure continuation hint is injected only when pruning actually removed older context
+- [x] Update `om_status` to report tail retention settings + effective cutoff
 
 ## Phase 2 — Actor Injection Contract (Mastra-like)
 
@@ -139,11 +139,11 @@ Additionally (optional but Mastra-aligned):
 
 ### Phase 2 TODO Checklist
 
-- [ ] Replace/extend the OM system injection to match Mastra's context prompt + instructions
-- [ ] Replace/extend the continuation hint to match Mastra's `OBSERVATION_CONTINUATION_HINT`
-- [ ] Add optional relative-time annotation at injection-time (no mutation of stored durable memory)
-- [ ] Ensure task/suggested response injection ordering matches intended priority (task hints should stay visible even when maintenance is required)
-- [ ] Persist durable observations untrimmed (except hard safety cap); apply token optimization and optional temporal annotations only when injecting into Actor context (do not compress/trim at write time in merge/reflect paths)
+- [x] Replace/extend the OM system injection to match Mastra's context prompt + instructions
+- [x] Replace/extend the continuation hint to match Mastra's `OBSERVATION_CONTINUATION_HINT`
+- [x] Add optional relative-time annotation at injection-time (no mutation of stored durable memory)
+- [x] Ensure task/suggested response injection ordering matches intended priority (task hints should stay visible even when maintenance is required)
+- [x] Persist durable observations untrimmed (except hard safety cap); apply token optimization and optional temporal annotations only when injecting into Actor context (do not compress/trim at write time in merge/reflect paths)
 
 ## Phase 3 — Observer Input Formatting (Mastra-like)
 
@@ -176,10 +176,10 @@ Depending on OpenCode internals, the plugin may not have access to *tool invocat
 
 ### Phase 3 TODO Checklist
 
-- [ ] Update “new history to observe” formatting to Mastra-like separators and timestamps
-- [ ] Include tool call and tool result encoding when available (or document limitations clearly)
-- [ ] Match truncation markers to Mastra conventions for long content
-- [ ] Validate observer/reflector sanitation still works with the new formatting
+- [x] Update “new history to observe” formatting to Mastra-like separators and timestamps
+- [x] Include tool call and tool result encoding when available (or document limitations clearly)
+- [x] Match truncation markers to Mastra conventions for long content
+- [x] Validate observer/reflector sanitation still works with the new formatting
 
 ## Phase 4 — Close Remaining Gaps (Still Synchronous)
 
@@ -197,16 +197,18 @@ Improve configurability and parity with Mastra’s implemented knobs without add
    - Mastra supports `scope: 'thread'|'resource'`.
    - OpenCode plugin currently behaves session-scoped; define how (or if) a “resource scope” maps to OpenCode concepts (project id, worktree, etc.).
    - Keep this behind a config flag; do not silently change scope behavior.
+   - Implemented mapping:
+     `session` = current session file/key, `project` = directory-derived shared key, `global` = single shared key.
 
 3) **Mastra-like “relative time” policy improvements**
    - Ensure injected relative-time annotations use the user’s locale/timezone consistently.
 
 ### Phase 4 TODO Checklist
 
-- [ ] Add threshold-range config (`{min,max}`) support (synchronous)
-- [ ] Add optional `shareTokenBudget` equivalent (synchronous), with clear guardrails
-- [ ] Define + document scope mapping options (`session`, `project`, optional `global`)
-- [ ] Extend `om_status` to report resolved thresholds + scope mode + derived budgets
+- [x] Add threshold-range config (`{min,max}`) support (synchronous)
+- [x] Add optional `shareTokenBudget` equivalent (synchronous), with clear guardrails
+- [x] Define + document scope mapping options (`session`, `project`, optional `global`)
+- [x] Extend `om_status` to report resolved thresholds + scope mode + derived budgets
 
 ## Verification (Per Phase)
 
@@ -220,4 +222,3 @@ This repository has no repo-wide test system; validation for OM changes should u
 - What is the safest “resource scope” analogue in OpenCode: project id, worktree path, git root, or an explicit user-provided key?
 - Should “tail retention” be counted in user anchors, raw tokens, or both?
 - Should relative-time annotations be enabled by default (token cost) or opt-in (clarity)?
-
