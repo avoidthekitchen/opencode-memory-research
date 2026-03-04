@@ -2,6 +2,8 @@
 
 This repository is a research and prototyping workspace for adding [Mastra-style memory](https://mastra.ai/research/observational-memory) [(1)](https://mastra.ai/blog/observational-memory)[(2)](https://mastra.ai/docs/memory/observational-memory) behavior to OpenCode, with a current focus on Phase 1 Observational Memory. Phase 1's main gap is that observe and reflect are synchronous rather than asynchronous, for the purposes of testing the hypothetic performance of Observational Memory with minimal architectural changes to OpenCode itself. This exists within a plugin itself that can be tried out on a per repo basis. 
 
+Small additional improvements include: a) improvements to reflect that restructures and condenses observations, and b) Prompt Caching Optimizations
+
 ## What Lives Here
 
 The repository has four layers:
