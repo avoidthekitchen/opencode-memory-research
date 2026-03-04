@@ -36,12 +36,13 @@ function parseSessionID(args) {
 }
 
 function formatCompactStatus(status, statePath, stateExists) {
-  const { thresholds, current } = status
+  const { thresholds, current, scope } = status
   const lines = [
-    `session=${status.sessionID} state=${stateExists ? "present" : "missing"}`,
+    `session=${status.sessionID} scope=${scope.mode} state=${stateExists ? "present" : "missing"}`,
     `buffer=${current.bufferTokens} memory=${current.memoryTokens} lastObserved=${current.lastObservedTurnAnchor ?? "-"}`,
     `deferred=${current.maintenanceDeferredTurns} lock=${current.lockContention ? "yes" : "no"}`,
-    `observe=${thresholds.observationThresholdTokens} reflect=${thresholds.reflectionThresholdTokens} raw=${thresholds.rawMessageBudgetTokens}`,
+    `observe=${thresholds.observationThresholdTokens} reflect=${thresholds.reflectionThresholdTokens} raw=${thresholds.rawMessageBudgetTokens} shared=${thresholds.sharedBudgetTokens ?? "-"}`,
+    `tailUsers=${current.tailRetentionUserTurns} tailTokens=${current.tailRetentionTokens ?? "-"} cutoff=${current.effectiveCutoffAnchor ?? "-"} protectedTail=${current.protectedTailAnchor ?? "-"}`,
     `hardObserve=${thresholds.observeHardOverdue} hardReflect=${thresholds.reflectHardOverdue}`,
     `path=${statePath}`,
   ]

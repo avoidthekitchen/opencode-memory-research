@@ -9,7 +9,7 @@ import {
 } from "./token-counter.ts";
 
 const PLUGIN_ID = "observational-memory";
-const STATE_VERSION = 4;
+const STATE_VERSION = 5;
 const LOCK_STALE_MS = 5 * 60 * 1000;
 const RECENT_USER_PROTECTION = 2;
 const DEFAULT_CONTEXT_LIMIT = 128000;
@@ -17,6 +17,26 @@ const MAX_OBSERVATION_LINE_CHARS = 10_000;
 const MAX_OBSERVATION_LINES = 400;
 const MAX_CURSOR_HINT_CHARS = 256;
 const TOOL_DEFINITION_HINT_TTL_MS = 60_000;
+const MIN_THRESHOLD_TOKENS = 1;
+const MIN_SHARED_BUDGET_TOKENS = 1_000;
+const DEFAULT_LOCALE = "en-US";
+
+const OBSERVATION_CONTINUATION_HINT = `This message is not from the user, the conversation history grew too long and wouldn't fit in context! Thankfully the entire conversation is stored in your memory observations. Please continue from where the observations left off. Do not refer to your "memory observations" directly, the user doesn't know about them, they are your memories! Just respond naturally as if you're remembering the conversation (you are!). Do not say "Hi there!" or "based on our previous conversation" as if the conversation is just starting, this is not a new conversation. This is an ongoing conversation, keep continuity by responding based on your memory. For example do not say "I understand. I've reviewed my memory observations", or "I remember [...]". Answer naturally following the suggestion from your memory. Note that your memory may contain a suggested first response, which you should follow.
+
+IMPORTANT: this system reminder is NOT from the user. The system placed it here as part of your memory system. This message is part of you remembering your conversation with the user.
+
+NOTE: Any messages following this system reminder are newer than your memories.`;
+
+const OBSERVATION_CONTEXT_PROMPT =
+  "The following observations block contains your memory of past conversations with this user.";
+
+const OBSERVATION_CONTEXT_INSTRUCTIONS = `IMPORTANT: When responding, reference specific details from these observations. Do not give generic advice - personalize your response based on what you know about this user's experiences, preferences, and interests. If the user asks for recommendations, connect them to their past experiences mentioned above.
+
+KNOWLEDGE UPDATES: When asked about current state (e.g., "where do I currently...", "what is my current..."), always prefer the MOST RECENT information. Observations include dates - if you see conflicting information, the newer observation supersedes the older one. Look for phrases like "will start", "is switching", "changed to", "moved to" as indicators that previous information has been updated.
+
+PLANNED ACTIONS: If the user stated they planned to do something (e.g., "I'm going to...", "I'm looking forward to...", "I will...") and the date they planned to do it is now in the past (check the relative time like "3 weeks ago"), assume they completed the action unless there's evidence they didn't. For example, if someone said "I'll start my new diet on Monday" and that was 2 weeks ago, assume they started the diet.
+
+MOST RECENT USER INPUT: Treat the most recent user message as the highest-priority signal for what to do next. Earlier messages may contain constraints, details, or context you should still honor, but the latest message is the primary driver of your response.`;
 
 const OBSERVER_EXTRACTION_INSTRUCTIONS = `CRITICAL: DISTINGUISH USER ASSERTIONS FROM QUESTIONS
 
@@ -334,6 +354,12 @@ Your current detail level was a 10/10, lets aim for a 4/10 detail level.
 
 type BufferKind = "user" | "assistant" | "tool";
 type MaintenanceToolID = "om_observe" | "om_reflect";
+type ScopeMode = "session" | "project" | "global";
+
+type ThresholdRange = {
+  min?: number;
+  max?: number;
+};
 
 type BufferItem = {
   kind: BufferKind;
@@ -341,12 +367,17 @@ type BufferItem = {
   turnAnchorMessageID: string;
   atMs: number;
   text: string;
+  toolName?: string;
+  toolArgs?: string;
+  toolResult?: string;
   tokenEstimate: number;
 };
 
-type OmStateV4 = {
-  version: 4;
+type OmStateV5 = {
+  version: 5;
   sessionID: string;
+  scopeMode: ScopeMode;
+  scopeKey: string;
   writerInstanceID: string;
   generation: number;
   lastObserved: {
@@ -382,6 +413,8 @@ type OmStateV4 = {
     currentTurnAnchorMessageID?: string;
     continuationHint?: boolean;
     lastPrunedMessageID?: string;
+    lastPruneCutoffAnchor?: string;
+    lastPrunedCount?: number;
     maintenancePromptIssued?: boolean;
     pendingMaintenanceTool?: MaintenanceToolID;
     observeCursorHint?: string;
@@ -392,8 +425,17 @@ type OmConfig = {
   enabled: boolean;
   mode: "llm" | "deterministic";
   observeThresholdTokens?: number;
+  observeThresholdRange?: ThresholdRange;
   reflectThresholdTokens?: number;
+  reflectThresholdRange?: ThresholdRange;
   rawMessageBudgetTokens?: number;
+  tailRetentionUserTurns?: number;
+  tailRetentionTokens?: number;
+  shareTokenBudget: boolean;
+  scope: ScopeMode;
+  relativeTimeAnnotations: boolean;
+  relativeTimeLocale: string;
+  relativeTimeTimeZone?: string;
   toolOutputChars: number;
   stateDir?: string;
   maxObserveInputChars: number;
@@ -406,6 +448,11 @@ type Thresholds = {
   observationThresholdTokens: number;
   reflectionThresholdTokens: number;
   rawMessageBudgetTokens: number;
+  tailRetentionUserTurns: number;
+  tailRetentionTokens?: number;
+  shareTokenBudget: boolean;
+  sharedBudgetTokens?: number;
+  scope: ScopeMode;
   observeHardOverdue: number;
   reflectHardOverdue: number;
 };
@@ -415,6 +462,13 @@ type RuntimeStatus = {
   shouldPrune: boolean;
   continuationHint: boolean;
   requiredTool?: MaintenanceToolID;
+  pruneCutoffAnchor?: string;
+  protectedTailAnchor?: string;
+  retainedTailTokens?: number;
+  tailRetentionUserTurns: number;
+  tailRetentionTokens?: number;
+  rawBudgetApplied: boolean;
+  thresholds?: Thresholds;
   promptDiagnostics?: {
     transformedMessages: MessageCountDiagnostics;
     injectedSystemTokens: number;
@@ -455,7 +509,7 @@ type ObservationGroup = {
   lines: string[];
 };
 
-const cache = new Map<string, OmStateV4>();
+const cache = new Map<string, OmStateV5>();
 const runtimeStatus = new Map<string, RuntimeStatus>();
 const configCache = new Map<string, Promise<OmConfig>>();
 const writerInstanceID = randomUUID();
@@ -629,7 +683,7 @@ export const ObservationalMemoryPlugin = async ({
           turnAnchorMessageID: output.message.id,
           atMs: Date.now(),
           text,
-          tokenEstimate: countStringTokens(text),
+          tokenEstimate: 0,
         });
         state.flags.maintenanceDeferred = false;
         state.runtime.continuationHint = false;
@@ -639,20 +693,30 @@ export const ObservationalMemoryPlugin = async ({
     "tool.execute.after": async (input, output) => {
       if (!input.sessionID) return;
       if (isOmTool(input.tool)) return;
-      const content = normalizeText(output.output);
-      if (!content) return;
       await withState(input.sessionID, directory, async (state, cfg) => {
         const anchor = state.runtime.currentTurnAnchorMessageID;
         if (!anchor) return state;
-        const text = truncateText(content, cfg.toolOutputChars);
-        const storedText = `${input.tool}: ${text}`;
+        const toolArgs = truncateWithNotice(
+          stringifyStructuredValue(extractToolArguments(input)),
+          cfg.toolOutputChars,
+        );
+        const toolResult = truncateWithNotice(
+          stringifyStructuredValue(output.output),
+          cfg.toolOutputChars,
+        );
+        const storedText =
+          toolResult || toolArgs ? `${input.tool}` : normalizeText(input.tool);
+        if (!storedText) return state;
         appendBufferItem(state, {
           kind: "tool",
-          id: `${input.callID}:${hashText(text)}`,
+          id: `${input.callID}:${hashText(`${toolArgs}\n${toolResult}`)}`,
           turnAnchorMessageID: anchor,
           atMs: Date.now(),
           text: storedText,
-          tokenEstimate: countStringTokens(storedText),
+          toolName: input.tool,
+          toolArgs: toolArgs || undefined,
+          toolResult: toolResult || undefined,
+          tokenEstimate: 0,
         });
         return state;
       });
@@ -685,7 +749,7 @@ export const ObservationalMemoryPlugin = async ({
             turnAnchorMessageID: info.parentID,
             atMs: info.time.completed ?? Date.now(),
             text,
-            tokenEstimate: countStringTokens(text),
+            tokenEstimate: 0,
           });
           return state;
         });
@@ -722,7 +786,7 @@ export const ObservationalMemoryPlugin = async ({
       const config = await getConfig(directory);
       if (!config.enabled) return;
       const state = await loadState(sessionID, directory);
-      const thresholds = resolveThresholds(config, DEFAULT_CONTEXT_LIMIT);
+      const thresholds = resolveThresholds(config, DEFAULT_CONTEXT_LIMIT, state);
       evaluateFlags(state, thresholds);
       const requiredTool = selectMaintenanceTool(state);
       const transformedMessages = tokenCounter.inspectMessages(output.messages);
@@ -738,6 +802,13 @@ export const ObservationalMemoryPlugin = async ({
         shouldPrune: prune.pruned,
         continuationHint: prune.continuationHint,
         requiredTool,
+        pruneCutoffAnchor: prune.pruneCutoffAnchor,
+        protectedTailAnchor: prune.protectedTailAnchor,
+        retainedTailTokens: prune.retainedTailTokens,
+        tailRetentionUserTurns: thresholds.tailRetentionUserTurns,
+        tailRetentionTokens: thresholds.tailRetentionTokens,
+        rawBudgetApplied: prune.rawBudgetApplied,
+        thresholds,
         promptDiagnostics: {
           transformedMessages,
           injectedSystemTokens: 0,
@@ -757,7 +828,11 @@ export const ObservationalMemoryPlugin = async ({
       if (!input.sessionID) return;
       const config = await getConfig(directory);
       if (!config.enabled) return;
-      const thresholds = resolveThresholds(config, input.model.limit.context);
+      const thresholds = resolveThresholds(
+        config,
+        input.model.limit.context,
+        await loadState(input.sessionID, directory),
+      );
       const ready = await ensureMemoryReady(
         input.sessionID,
         directory,
@@ -772,10 +847,20 @@ export const ObservationalMemoryPlugin = async ({
         },
       );
 
+      const resolvedThresholds = resolveThresholds(
+        config,
+        input.model.limit.context,
+        ready,
+      );
+
       const runtime = runtimeStatus.get(input.sessionID) ?? {
         shouldInject: false,
         shouldPrune: false,
         continuationHint: false,
+        tailRetentionUserTurns: resolvedThresholds.tailRetentionUserTurns,
+        tailRetentionTokens: resolvedThresholds.tailRetentionTokens,
+        rawBudgetApplied: false,
+        thresholds: resolvedThresholds,
       };
       let injectedMaintenanceTokens = 0;
       let injectedMemoryTokens = 0;
@@ -795,7 +880,7 @@ export const ObservationalMemoryPlugin = async ({
         injectedMaintenanceTokens += countStringTokens(block);
         runtime.shouldInject = false;
       } else if (ready.memory.observations && !ready.flags.lockContention) {
-        const block = renderOmBlock(ready.memory);
+        const block = renderOmBlock(ready.memory, config, resolvedThresholds);
         output.system.push(block);
         injectedMemoryTokens += countStringTokens(block);
         runtime.shouldInject = true;
@@ -830,6 +915,9 @@ export const ObservationalMemoryPlugin = async ({
       }
 
       runtime.requiredTool = requiredTool;
+      runtime.tailRetentionUserTurns = resolvedThresholds.tailRetentionUserTurns;
+      runtime.tailRetentionTokens = resolvedThresholds.tailRetentionTokens;
+      runtime.thresholds = resolvedThresholds;
       runtime.promptDiagnostics = {
         transformedMessages:
           runtime.promptDiagnostics?.transformedMessages ??
@@ -852,10 +940,15 @@ export const ObservationalMemoryPlugin = async ({
   };
 };
 
-function createEmptyState(sessionID: string): OmStateV4 {
+function createEmptyState(
+  sessionID: string,
+  scope: { mode: ScopeMode; key: string },
+): OmStateV5 {
   return {
     version: STATE_VERSION,
     sessionID,
+    scopeMode: scope.mode,
+    scopeKey: scope.key,
     writerInstanceID,
     generation: 0,
     lastObserved: {},
@@ -877,24 +970,30 @@ function createEmptyState(sessionID: string): OmStateV4 {
   };
 }
 
-function migrateState(sessionID: string, parsed: unknown): OmStateV4 {
-  const legacy = parsed as Partial<OmStateV4> & {
+function migrateState(
+  sessionID: string,
+  parsed: unknown,
+  scope: { mode: ScopeMode; key: string },
+): OmStateV5 {
+  const legacy = parsed as Partial<OmStateV5> & {
     version?: number;
-    lastObserved?: OmStateV4["lastObserved"];
-    buffer?: OmStateV4["buffer"];
-    memory?: OmStateV4["memory"];
-    stats?: Partial<OmStateV4["stats"]>;
-    flags?: OmStateV4["flags"];
-    runtime?: Partial<OmStateV4["runtime"]>;
+    lastObserved?: OmStateV5["lastObserved"];
+    buffer?: OmStateV5["buffer"];
+    memory?: OmStateV5["memory"];
+    stats?: Partial<OmStateV5["stats"]>;
+    flags?: OmStateV5["flags"];
+    runtime?: Partial<OmStateV5["runtime"]>;
   };
   if (legacy.version === STATE_VERSION) {
     return {
-      ...createEmptyState(sessionID),
+      ...createEmptyState(sessionID, scope),
       ...legacy,
       version: STATE_VERSION,
       sessionID,
+      scopeMode: scope.mode,
+      scopeKey: scope.key,
       stats: {
-        ...createEmptyState(sessionID).stats,
+        ...createEmptyState(sessionID, scope).stats,
         ...legacy.stats,
       },
       runtime: {
@@ -902,17 +1001,19 @@ function migrateState(sessionID: string, parsed: unknown): OmStateV4 {
       },
     };
   }
-  if (legacy.version === 3) {
+  if (legacy.version === 4 || legacy.version === 3) {
     return {
-      ...createEmptyState(sessionID),
+      ...createEmptyState(sessionID, scope),
       sessionID,
+      scopeMode: scope.mode,
+      scopeKey: scope.key,
       writerInstanceID: legacy.writerInstanceID ?? writerInstanceID,
       generation: legacy.generation ?? 0,
       lastObserved: legacy.lastObserved ?? {},
-      buffer: legacy.buffer ?? { items: [], tokenEstimateTotal: 0 },
+      buffer: normalizeMigratedBuffer(legacy.buffer),
       memory: legacy.memory ?? emptyMemory(),
       stats: {
-        ...createEmptyState(sessionID).stats,
+        ...createEmptyState(sessionID, scope).stats,
         ...legacy.stats,
       },
       flags: legacy.flags ?? {},
@@ -921,7 +1022,40 @@ function migrateState(sessionID: string, parsed: unknown): OmStateV4 {
       },
     };
   }
-  return createEmptyState(sessionID);
+  return createEmptyState(sessionID, scope);
+}
+
+function normalizeMigratedBuffer(buffer: Partial<OmStateV5["buffer"]> | undefined) {
+  const items = (buffer?.items ?? []).map((item) => {
+    const text = typeof item?.text === "string" ? item.text : "";
+    const toolResult =
+      typeof item?.toolResult === "string" ? item.toolResult : undefined;
+    const toolArgs =
+      typeof item?.toolArgs === "string" ? item.toolArgs : undefined;
+    const normalized: BufferItem = {
+      kind:
+        item?.kind === "assistant" || item?.kind === "tool" ? item.kind : "user",
+      id: typeof item?.id === "string" ? item.id : randomUUID(),
+      turnAnchorMessageID:
+        typeof item?.turnAnchorMessageID === "string"
+          ? item.turnAnchorMessageID
+          : typeof item?.id === "string"
+            ? item.id
+            : randomUUID(),
+      atMs: typeof item?.atMs === "number" ? item.atMs : Date.now(),
+      text,
+      toolName: typeof item?.toolName === "string" ? item.toolName : undefined,
+      toolArgs,
+      toolResult,
+      tokenEstimate: 0,
+    };
+    normalized.tokenEstimate = countBufferItemTokens(normalized);
+    return normalized;
+  });
+  return {
+    items,
+    tokenEstimateTotal: items.reduce((total, item) => total + item.tokenEstimate, 0),
+  };
 }
 
 function emptyMemory() {
@@ -941,6 +1075,13 @@ function normalizeText(text: string | undefined) {
 function truncateText(text: string, maxChars: number) {
   if (text.length <= maxChars) return text;
   return `${text.slice(0, Math.max(0, maxChars - 3)).trimEnd()}...`;
+}
+
+function truncateWithNotice(text: string, maxChars: number) {
+  if (text.length <= maxChars) return text;
+  const truncated = text.slice(0, Math.max(0, maxChars));
+  const remaining = text.length - maxChars;
+  return `${truncated}\n... [truncated ${remaining} characters]`;
 }
 
 function hashText(text: string) {
@@ -987,26 +1128,55 @@ function countStringTokens(text: string) {
   return tokenCounter.countString(text);
 }
 
-function countInjectedMemoryTokens(memory: OmStateV4["memory"]) {
-  if (memory.observations) {
-    return countStringTokens(renderOmBlock(memory));
+function stringifyStructuredValue(value: unknown) {
+  if (value === undefined || value === null) return "";
+  if (typeof value === "string") return value.trim();
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
   }
-  if (memory.currentTask || memory.suggestedResponse) {
-    return countStringTokens(renderTaskHints(memory));
-  }
-  return 0;
 }
 
-function refreshStateTokenEstimates(state: OmStateV4) {
+function renderBufferItem(item: BufferItem) {
+  if (item.kind !== "tool") return item.text;
+  const parts: string[] = [];
+  const toolName = item.toolName ?? "tool";
+  if (item.toolArgs) {
+    parts.push(`[Tool Call: ${toolName}]`, item.toolArgs);
+  }
+  if (item.toolResult) {
+    parts.push(`[Tool Result: ${toolName}]`, item.toolResult);
+  }
+  if (!parts.length && item.text) {
+    parts.push(item.text);
+  }
+  return parts.join("\n");
+}
+
+function countBufferItemTokens(item: BufferItem) {
+  return countStringTokens(renderBufferItem(item));
+}
+
+function countStoredMemoryTokens(memory: OmStateV5["memory"]) {
+  const parts = [
+    memory.observations,
+    memory.currentTask,
+    memory.suggestedResponse,
+  ].filter(Boolean);
+  return countStringTokens(parts.join("\n"));
+}
+
+function refreshStateTokenEstimates(state: OmStateV5) {
   state.buffer.items = state.buffer.items.map((item) => ({
     ...item,
-    tokenEstimate: countStringTokens(item.text),
+    tokenEstimate: countBufferItemTokens(item),
   }));
   state.buffer.tokenEstimateTotal = state.buffer.items.reduce(
     (total, entry) => total + entry.tokenEstimate,
     0,
   );
-  state.memory.tokenEstimate = countInjectedMemoryTokens(state.memory);
+  state.memory.tokenEstimate = countStoredMemoryTokens(state.memory);
 }
 
 function isOmTool(toolID: string) {
@@ -1019,8 +1189,9 @@ function isOmTool(toolID: string) {
   );
 }
 
-function appendBufferItem(state: OmStateV4, item: BufferItem) {
+function appendBufferItem(state: OmStateV5, item: BufferItem) {
   if (!item.text) return;
+  item.tokenEstimate = countBufferItemTokens(item);
   if (
     state.buffer.items.some(
       (existing) => existing.kind === item.kind && existing.id === item.id,
@@ -1152,7 +1323,7 @@ async function ensureMemoryReady(
 }
 
 function runDeterministicObserve(
-  state: OmStateV4,
+  state: OmStateV5,
   config: OmConfig,
   thresholds: Thresholds,
   options: { force: boolean },
@@ -1181,14 +1352,13 @@ function runDeterministicObserve(
     state.memory.observations,
     chunks.join("\n"),
     config,
-    thresholds,
   );
   const currentTask = inferCurrentTask(state, config.maxTaskChars);
 
   state.memory.observations = merged;
   state.memory.currentTask = currentTask || undefined;
   state.memory.suggestedResponse = undefined;
-  state.memory.tokenEstimate = countInjectedMemoryTokens(state.memory);
+  state.memory.tokenEstimate = countStoredMemoryTokens(state.memory);
   state.memory.updatedAtMs = Date.now();
   state.lastObserved.turnAnchorMessageID = completedAnchors.at(-1);
   state.lastObserved.atMs = observedItems[observedItems.length - 1]?.atMs;
@@ -1206,7 +1376,7 @@ function runDeterministicObserve(
 }
 
 function runDeterministicReflect(
-  state: OmStateV4,
+  state: OmStateV5,
   options: { force: boolean },
 ) {
   if (!state.memory.observations && !options.force) {
@@ -1221,7 +1391,7 @@ function runDeterministicReflect(
     .filter(Boolean);
   const compacted = dedupeLines(lines).slice(-12);
   state.memory.observations = compacted.join("\n");
-  state.memory.tokenEstimate = countInjectedMemoryTokens(state.memory);
+  state.memory.tokenEstimate = countStoredMemoryTokens(state.memory);
   state.memory.updatedAtMs = Date.now();
   state.stats.totalReflections += 1;
   state.flags.reflectRequired = false;
@@ -1229,7 +1399,7 @@ function runDeterministicReflect(
 }
 
 function applyObserveToolResult(
-  state: OmStateV4,
+  state: OmStateV5,
   config: OmConfig,
   args: {
     observations: string;
@@ -1238,7 +1408,7 @@ function applyObserveToolResult(
     confirmObservedThrough?: string;
   },
 ) {
-  const thresholds = resolveThresholds(config, DEFAULT_CONTEXT_LIMIT);
+  const thresholds = resolveThresholds(config, DEFAULT_CONTEXT_LIMIT, state);
   evaluateFlags(state, thresholds);
   const requiredTool = selectMaintenanceTool(state);
   if (config.mode === "llm" && requiredTool && requiredTool !== "om_observe") {
@@ -1305,11 +1475,10 @@ function applyObserveToolResult(
     state.memory.observations,
     sanitized.observations,
     config,
-    thresholds,
   );
   state.memory.currentTask = sanitized.currentTask;
   state.memory.suggestedResponse = sanitized.suggestedResponse;
-  state.memory.tokenEstimate = countInjectedMemoryTokens(state.memory);
+  state.memory.tokenEstimate = countStoredMemoryTokens(state.memory);
   state.memory.updatedAtMs = Date.now();
   state.lastObserved.turnAnchorMessageID = anchorsToApply.at(-1);
   state.lastObserved.atMs = observedItems[observedItems.length - 1]?.atMs;
@@ -1332,7 +1501,7 @@ function applyObserveToolResult(
 }
 
 function applyReflectToolResult(
-  state: OmStateV4,
+  state: OmStateV5,
   config: OmConfig,
   args: {
     observations: string;
@@ -1340,7 +1509,7 @@ function applyReflectToolResult(
     suggestedResponse?: string;
   },
 ) {
-  const thresholds = resolveThresholds(config, DEFAULT_CONTEXT_LIMIT);
+  const thresholds = resolveThresholds(config, DEFAULT_CONTEXT_LIMIT, state);
   evaluateFlags(state, thresholds);
   const requiredTool = selectMaintenanceTool(state);
   if (config.mode === "llm" && requiredTool && requiredTool !== "om_reflect") {
@@ -1360,7 +1529,7 @@ function applyReflectToolResult(
     return state;
   }
 
-  const previousTokens = countInjectedMemoryTokens(state.memory);
+  const previousTokens = countStoredMemoryTokens(state.memory);
   const nextMemory = {
     ...state.memory,
     observations: sanitized.observations,
@@ -1369,7 +1538,7 @@ function applyReflectToolResult(
       ? sanitized.suggestedResponse
       : undefined,
   };
-  const newTokens = countInjectedMemoryTokens(nextMemory);
+  const newTokens = countStoredMemoryTokens(nextMemory);
   const targetThreshold = thresholds.reflectionThresholdTokens;
   const compressionFailed =
     state.stats.reflectFailures < 3 &&
@@ -1382,13 +1551,9 @@ function applyReflectToolResult(
     return state;
   }
 
-  state.memory.observations = trimObservationGroups(
-    sanitizeObservationText(
-      sanitized.observations,
-      config.maxObservationsChars,
-    ),
-    config,
-    thresholds,
+  state.memory.observations = sanitizeObservationText(
+    sanitized.observations,
+    config.maxObservationsChars,
   );
   state.memory.currentTask = sanitized.hasCurrentTask
     ? sanitized.currentTask
@@ -1396,7 +1561,7 @@ function applyReflectToolResult(
   state.memory.suggestedResponse = sanitized.hasSuggestedResponse
     ? sanitized.suggestedResponse
     : undefined;
-  state.memory.tokenEstimate = countInjectedMemoryTokens(state.memory);
+  state.memory.tokenEstimate = countStoredMemoryTokens(state.memory);
   state.memory.updatedAtMs = Date.now();
   state.stats.totalReflections += 1;
   state.stats.reflectFailures = 0;
@@ -1443,7 +1608,7 @@ function summarizeObservedTurn(
   return [`Turn ${anchor}:`, ...lines].join(" ");
 }
 
-function inferCurrentTask(state: OmStateV4, maxChars: number) {
+function inferCurrentTask(state: OmStateV5, maxChars: number) {
   const pendingUser = [...state.buffer.items]
     .reverse()
     .find((item) => item.kind === "user");
@@ -1491,14 +1656,14 @@ function observableBufferItems(items: BufferItem[]) {
   return items.filter((item) => completed.has(item.turnAnchorMessageID));
 }
 
-function observableBufferTokenTotal(state: OmStateV4) {
+function observableBufferTokenTotal(state: OmStateV5) {
   return observableBufferItems(state.buffer.items).reduce(
     (total, item) => total + item.tokenEstimate,
     0,
   );
 }
 
-function evaluateFlags(state: OmStateV4, thresholds: Thresholds) {
+function evaluateFlags(state: OmStateV5, thresholds: Thresholds) {
   state.flags.observeRequired =
     observableBufferTokenTotal(state) >= thresholds.observationThresholdTokens;
   state.flags.reflectRequired =
@@ -1506,40 +1671,42 @@ function evaluateFlags(state: OmStateV4, thresholds: Thresholds) {
 }
 
 function selectMaintenanceTool(
-  state: OmStateV4,
+  state: OmStateV5,
 ): MaintenanceToolID | undefined {
   if (state.flags.observeRequired) return "om_observe";
   if (state.flags.reflectRequired) return "om_reflect";
   return undefined;
 }
 
-function renderOmBlock(memory: OmStateV4["memory"]) {
+function renderOmBlock(
+  memory: OmStateV5["memory"],
+  config: OmConfig,
+  thresholds: Thresholds,
+) {
   const parts = [
+    OBSERVATION_CONTEXT_PROMPT,
+    "",
     "<observations>",
-    escapeXml(memory.observations || "No durable observations yet."),
+    escapeXml(optimizeObservationsForInjection(memory.observations, config, thresholds)),
     "</observations>",
+    "",
+    OBSERVATION_CONTEXT_INSTRUCTIONS,
   ];
   if (memory.currentTask) {
-    parts.push(
-      "<current-task>",
-      escapeXml(memory.currentTask),
-      "</current-task>",
-    );
+    parts.push("", "<current-task>", escapeXml(memory.currentTask), "</current-task>");
   }
   if (memory.suggestedResponse) {
     parts.push(
+      "",
       "<suggested-response>",
       escapeXml(memory.suggestedResponse),
       "</suggested-response>",
     );
   }
-  parts.push(
-    "<system-reminder>Observations are authoritative for pruned earlier context. Use the newest observation when conflicts exist. Do not mention the memory system to the user.</system-reminder>",
-  );
   return parts.join("\n");
 }
 
-function renderTaskHints(memory: OmStateV4["memory"]) {
+function renderTaskHints(memory: OmStateV5["memory"]) {
   const parts: string[] = [];
   if (memory.currentTask) {
     parts.push(
@@ -1558,7 +1725,7 @@ function renderTaskHints(memory: OmStateV4["memory"]) {
   return parts.join("\n");
 }
 
-function renderObserveMaintenanceBlock(state: OmStateV4, config: OmConfig) {
+function renderObserveMaintenanceBlock(state: OmStateV5, config: OmConfig) {
   const observeInput = buildObserveInput(state, config);
   const previousObservations = state.memory.observations || "None.";
   const cursorHint = observeInput.lastIncludedAnchor
@@ -1596,7 +1763,7 @@ function renderObserveMaintenanceBlock(state: OmStateV4, config: OmConfig) {
   ].join("\n");
 }
 
-function renderReflectMaintenanceBlock(state: OmStateV4) {
+function renderReflectMaintenanceBlock(state: OmStateV5) {
   const retryLevel = Math.min(state.stats.reflectFailures, 3) as 0 | 1 | 2 | 3;
   const guidance = COMPRESSION_GUIDANCE[retryLevel];
 
@@ -1625,12 +1792,7 @@ function renderReflectMaintenanceBlock(state: OmStateV4) {
 }
 
 function renderContinuationHint() {
-  return [
-    "<system-reminder>",
-    "This is not a new conversation. Earlier context was compressed into observations.",
-    "Continue naturally without referencing the memory system.",
-    "</system-reminder>",
-  ].join("\n");
+  return `<system-reminder>${OBSERVATION_CONTINUATION_HINT}</system-reminder>`;
 }
 
 function escapeXml(text: string) {
@@ -1640,7 +1802,7 @@ function escapeXml(text: string) {
     .replaceAll(">", "&gt;");
 }
 
-function buildObserveInput(state: OmStateV4, config: OmConfig): ObserveInput {
+function buildObserveInput(state: OmStateV5, config: OmConfig): ObserveInput {
   const groups = groupBufferItemsByAnchor(
     observableBufferItems(state.buffer.items),
   );
@@ -1657,7 +1819,7 @@ function buildObserveInput(state: OmStateV4, config: OmConfig): ObserveInput {
       break;
     }
     if (!sections.length && next.length > config.maxObserveInputChars) {
-      sections.push(truncateText(section, config.maxObserveInputChars));
+      sections.push(truncateWithNotice(section, config.maxObserveInputChars));
       lastIncludedAnchor = anchor;
       itemCount += items.length;
       break;
@@ -1694,17 +1856,14 @@ function groupBufferItemsByAnchor(items: BufferItem[]) {
   );
 }
 
-function formatObservedTurnGroup(anchor: string, items: BufferItem[]) {
-  const lines: string[] = [];
-
-  for (const item of items) {
-    const role = labelForBufferKind(item.kind);
-    const timestamp = formatLocalTime(item.atMs);
-    const date = formatLocalDate(item.atMs);
-    lines.push(`**${role} (${date}, ${timestamp}):**\n${item.text}`);
-  }
-
-  return lines.join("\n\n");
+function formatObservedTurnGroup(_anchor: string, items: BufferItem[]) {
+  return items
+    .map((item) => {
+      const role = labelForBufferKind(item.kind);
+      const timestamp = formatObserverTimestamp(item.atMs);
+      return `**${role} (${timestamp}):**\n${renderBufferItem(item)}`;
+    })
+    .join("\n\n---\n\n");
 }
 
 function labelForBufferKind(kind: BufferKind) {
@@ -1713,19 +1872,14 @@ function labelForBufferKind(kind: BufferKind) {
   return "Tool";
 }
 
-function formatLocalDate(atMs: number) {
-  return new Date(atMs).toLocaleDateString("en-US", {
+function formatObserverTimestamp(atMs: number) {
+  return new Date(atMs).toLocaleString(DEFAULT_LOCALE, {
+    year: "numeric",
     month: "short",
     day: "numeric",
-    year: "numeric",
-  });
-}
-
-function formatLocalTime(atMs: number) {
-  return new Date(atMs).toLocaleTimeString("en-US", {
-    hour: "2-digit",
+    hour: "numeric",
     minute: "2-digit",
-    hour12: false,
+    hour12: true,
   });
 }
 
@@ -1752,7 +1906,6 @@ function mergeObservationTexts(
   existing: string,
   incoming: string,
   config: OmConfig,
-  thresholds: Thresholds,
 ) {
   const order: string[] = [];
   const merged = new Map<string, ObservationGroup>();
@@ -1774,10 +1927,12 @@ function mergeObservationTexts(
     }
   }
 
-  const text = renderObservationGroups(
+  return truncateText(
+    renderObservationGroups(
     order.map((key) => merged.get(key)!).filter(Boolean),
+    ),
+    config.maxObservationsChars,
   );
-  return trimObservationGroups(text, config, thresholds);
 }
 
 function renderObservationGroups(groups: ObservationGroup[]) {
@@ -2002,12 +2157,219 @@ function getSessionIDFromMessages(
   return messages.find((message) => message.info?.sessionID)?.info?.sessionID;
 }
 
+function countMessageTokens(message: {
+  info: { id: string; role: string; sessionID: string };
+  parts: Array<{ type?: string; text?: string }>;
+}) {
+  return tokenCounter.inspectMessages([message]).tokens;
+}
+
+function extractToolArguments(input: Record<string, unknown>) {
+  const candidate =
+    input.args ??
+    input.input ??
+    input.parameters ??
+    input.argument ??
+    input.arguments;
+  return candidate;
+}
+
+function resolveThresholdValue(
+  explicit: number | undefined,
+  range: ThresholdRange | undefined,
+  fallback: number,
+) {
+  let value = explicit ?? fallback;
+  if (range?.min !== undefined) value = Math.max(value, range.min);
+  if (range?.max !== undefined) value = Math.min(value, range.max);
+  return Math.max(MIN_THRESHOLD_TOKENS, Math.floor(value));
+}
+
+function optimizeObservationsForInjection(
+  observations: string,
+  config: OmConfig,
+  thresholds: Thresholds,
+) {
+  if (!observations) return "No durable observations yet.";
+  let optimized = trimObservationGroups(observations, config, thresholds);
+  if (config.relativeTimeAnnotations) {
+    optimized = addRelativeTimeToObservations(
+      optimized,
+      new Date(),
+      config.relativeTimeLocale,
+      config.relativeTimeTimeZone,
+    );
+  }
+  return optimized;
+}
+
+function zonedDayStamp(date: Date, timeZone?: string) {
+  if (!timeZone) {
+    return Date.UTC(date.getFullYear(), date.getMonth(), date.getDate());
+  }
+  const parts = new Intl.DateTimeFormat(DEFAULT_LOCALE, {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date);
+  const year = Number(parts.find((part) => part.type === "year")?.value ?? date.getFullYear());
+  const month = Number(parts.find((part) => part.type === "month")?.value ?? date.getMonth() + 1);
+  const day = Number(parts.find((part) => part.type === "day")?.value ?? date.getDate());
+  return Date.UTC(year, month - 1, day);
+}
+
+function formatRelativeTime(date: Date, currentDate: Date, timeZone?: string) {
+  const diffMs = zonedDayStamp(currentDate, timeZone) - zonedDayStamp(date, timeZone);
+  const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+
+  if (diffDays === 0) return "today";
+  if (diffDays === 1) return "yesterday";
+  if (diffDays < 7) return `${diffDays} days ago`;
+  if (diffDays < 14) return "1 week ago";
+  if (diffDays < 30) return `${Math.floor(diffDays / 7)} weeks ago`;
+  if (diffDays < 60) return "1 month ago";
+  if (diffDays < 365) return `${Math.floor(diffDays / 30)} months ago`;
+  const years = Math.floor(diffDays / 365);
+  return `${years} year${years > 1 ? "s" : ""} ago`;
+}
+
+function formatGapBetweenDates(prevDate: Date, currDate: Date, timeZone?: string) {
+  const diffDays = Math.floor(
+    (zonedDayStamp(currDate, timeZone) - zonedDayStamp(prevDate, timeZone)) /
+      (1000 * 60 * 60 * 24),
+  );
+  if (diffDays <= 1) return null;
+  if (diffDays < 7) return `[${diffDays} days later]`;
+  if (diffDays < 14) return "[1 week later]";
+  if (diffDays < 30) return `[${Math.floor(diffDays / 7)} weeks later]`;
+  if (diffDays < 60) return "[1 month later]";
+  return `[${Math.floor(diffDays / 30)} months later]`;
+}
+
+function parseDateFromContent(dateContent: string) {
+  const simpleDateMatch = dateContent.match(/([A-Z][a-z]+)\s+(\d{1,2}),?\s+(\d{4})/);
+  if (simpleDateMatch) {
+    const parsed = new Date(`${simpleDateMatch[1]} ${simpleDateMatch[2]}, ${simpleDateMatch[3]}`);
+    if (!Number.isNaN(parsed.getTime())) return parsed;
+  }
+  const rangeMatch = dateContent.match(/([A-Z][a-z]+)\s+(\d{1,2})-\d{1,2},?\s+(\d{4})/);
+  if (rangeMatch) {
+    const parsed = new Date(`${rangeMatch[1]} ${rangeMatch[2]}, ${rangeMatch[3]}`);
+    if (!Number.isNaN(parsed.getTime())) return parsed;
+  }
+  const vagueMatch = dateContent.match(
+    /(late|early|mid)[- ]?(?:to[- ]?(?:late|early|mid)[- ]?)?([A-Z][a-z]+)\s+(\d{4})/i,
+  );
+  if (vagueMatch) {
+    const day = vagueMatch[1]?.toLowerCase() === "early" ? 7 : vagueMatch[1]?.toLowerCase() === "late" ? 23 : 15;
+    const parsed = new Date(`${vagueMatch[2]} ${day}, ${vagueMatch[3]}`);
+    if (!Number.isNaN(parsed.getTime())) return parsed;
+  }
+  return null;
+}
+
+function isFutureIntentObservation(line: string) {
+  return [
+    /\bwill\s+(?:be\s+)?(?:\w+ing|\w+)\b/i,
+    /\bplans?\s+to\b/i,
+    /\bplanning\s+to\b/i,
+    /\blooking\s+forward\s+to\b/i,
+    /\bgoing\s+to\b/i,
+    /\bintends?\s+to\b/i,
+    /\bwants?\s+to\b/i,
+    /\bneeds?\s+to\b/i,
+    /\babout\s+to\b/i,
+  ].some((pattern) => pattern.test(line));
+}
+
+function expandInlineEstimatedDates(
+  observations: string,
+  currentDate: Date,
+  timeZone?: string,
+) {
+  const inlineDateRegex = /\((estimated|meaning)\s+([^)]+\d{4})\)/gi;
+  return observations.replace(
+    inlineDateRegex,
+    (match, prefix: string, dateContent: string) => {
+      const targetDate = parseDateFromContent(dateContent);
+      if (!targetDate) return match;
+      const relative = formatRelativeTime(targetDate, currentDate, timeZone);
+      const matchIndex = observations.indexOf(match);
+      const lineStart = observations.lastIndexOf("\n", matchIndex) + 1;
+      const lineBeforeDate = observations.substring(lineStart, matchIndex);
+      if (targetDate < currentDate && isFutureIntentObservation(lineBeforeDate)) {
+        return `(${prefix} ${dateContent} - ${relative}, likely already happened)`;
+      }
+      return `(${prefix} ${dateContent} - ${relative})`;
+    },
+  );
+}
+
+function addRelativeTimeToObservations(
+  observations: string,
+  currentDate: Date,
+  locale: string,
+  timeZone?: string,
+) {
+  const withInlineDates = expandInlineEstimatedDates(
+    observations,
+    currentDate,
+    timeZone,
+  );
+  const dateHeaderRegex = /^(Date:\s*)([A-Z][a-z]+ \d{1,2}, \d{4})$/gm;
+  const dates: Array<{
+    index: number;
+    date: Date;
+    match: string;
+    prefix: string;
+    dateStr: string;
+  }> = [];
+  let regexMatch: RegExpExecArray | null;
+  while ((regexMatch = dateHeaderRegex.exec(withInlineDates)) !== null) {
+    const dateStr = regexMatch[2]!;
+    const parsed = new Date(dateStr);
+    if (!Number.isNaN(parsed.getTime())) {
+      dates.push({
+        index: regexMatch.index,
+        date: parsed,
+        match: regexMatch[0],
+        prefix: regexMatch[1]!,
+        dateStr:
+          parsed.toLocaleDateString(locale || DEFAULT_LOCALE, {
+            timeZone,
+            month: "short",
+            day: "numeric",
+            year: "numeric",
+          }) || dateStr,
+      });
+    }
+  }
+  if (!dates.length) return withInlineDates;
+
+  let result = "";
+  let lastIndex = 0;
+  for (let index = 0; index < dates.length; index += 1) {
+    const curr = dates[index]!;
+    const prev = index > 0 ? dates[index - 1]! : undefined;
+    result += withInlineDates.slice(lastIndex, curr.index);
+    if (prev) {
+      const gap = formatGapBetweenDates(prev.date, curr.date, timeZone);
+      if (gap) result += `\n${gap}\n\n`;
+    }
+    result += `${curr.prefix}${curr.dateStr} (${formatRelativeTime(curr.date, currentDate, timeZone)})`;
+    lastIndex = curr.index + curr.match.length;
+  }
+  result += withInlineDates.slice(lastIndex);
+  return result;
+}
+
 function pruneMessages(
   messages: Array<{
     info: { id: string; role: string; sessionID: string };
     parts: Array<{ type?: string; text?: string }>;
   }>,
-  state: OmStateV4,
+  state: OmStateV5,
   thresholds: Thresholds,
   requiredTool?: MaintenanceToolID,
   transformedMessages = tokenCounter.inspectMessages(messages),
@@ -2018,6 +2380,10 @@ function pruneMessages(
       pruned: false,
       continuationHint: false,
       shouldInject: false,
+      pruneCutoffAnchor: undefined,
+      protectedTailAnchor: undefined,
+      retainedTailTokens: 0,
+      rawBudgetApplied: false,
     };
   }
 
@@ -2030,6 +2396,10 @@ function pruneMessages(
       pruned: false,
       continuationHint: false,
       shouldInject: !!state.memory.observations,
+      pruneCutoffAnchor: undefined,
+      protectedTailAnchor: undefined,
+      retainedTailTokens: transformedMessages.tokens,
+      rawBudgetApplied: false,
     };
   }
   if (!state.lastObserved.turnAnchorMessageID || !state.memory.observations) {
@@ -2038,11 +2408,20 @@ function pruneMessages(
       pruned: false,
       continuationHint: false,
       shouldInject: false,
+      pruneCutoffAnchor: undefined,
+      protectedTailAnchor: undefined,
+      retainedTailTokens: transformedMessages.tokens,
+      rawBudgetApplied: false,
     };
   }
 
   const protectedStartIndex =
-    userIndexes[userIndexes.length - RECENT_USER_PROTECTION];
+    userIndexes[
+      Math.max(
+        0,
+        userIndexes.length - Math.max(RECENT_USER_PROTECTION, thresholds.tailRetentionUserTurns),
+      )
+    ];
   const protectedStartID = messages[protectedStartIndex]?.info.id;
   if (!protectedStartID) {
     return {
@@ -2050,6 +2429,10 @@ function pruneMessages(
       pruned: false,
       continuationHint: false,
       shouldInject: false,
+      pruneCutoffAnchor: undefined,
+      protectedTailAnchor: undefined,
+      retainedTailTokens: transformedMessages.tokens,
+      rawBudgetApplied: false,
     };
   }
 
@@ -2061,12 +2444,16 @@ function pruneMessages(
       pruned: false,
       continuationHint: false,
       shouldInject: false,
+      pruneCutoffAnchor: undefined,
+      protectedTailAnchor: protectedStartID,
+      retainedTailTokens: transformedMessages.tokens,
+      rawBudgetApplied: false,
     };
   }
 
   const cutoffAnchorIndex = Math.min(
     observedIndex,
-    userIndexes.length - RECENT_USER_PROTECTION - 1,
+    userIndexes.length - thresholds.tailRetentionUserTurns - 1,
   );
   if (cutoffAnchorIndex < 0) {
     return {
@@ -2074,56 +2461,108 @@ function pruneMessages(
       pruned: false,
       continuationHint: false,
       shouldInject: true,
+      pruneCutoffAnchor: undefined,
+      protectedTailAnchor: protectedStartID,
+      retainedTailTokens: transformedMessages.tokens,
+      rawBudgetApplied: false,
     };
   }
 
-  const currentTokens = transformedMessages.tokens;
-  if (currentTokens <= thresholds.rawMessageBudgetTokens) {
-    return {
-      messages,
-      pruned: false,
-      continuationHint: false,
-      shouldInject: true,
-    };
+  let keepFromIndex = userIndexes[cutoffAnchorIndex + 1] ?? 0;
+  if (thresholds.tailRetentionTokens) {
+    let retainedTokens = 0;
+    let tokenTailIndex = messages.length;
+    while (tokenTailIndex > 0 && retainedTokens < thresholds.tailRetentionTokens) {
+      tokenTailIndex -= 1;
+      retainedTokens += countMessageTokens(messages[tokenTailIndex]);
+    }
+    keepFromIndex = Math.min(keepFromIndex, tokenTailIndex);
   }
 
-  const keepFromIndex = userIndexes[cutoffAnchorIndex + 1] ?? 0;
   const pruned = messages.slice(keepFromIndex);
+  const retainedTailTokens = tokenCounter.inspectMessages(pruned).tokens;
   return {
     messages: pruned,
     pruned: pruned.length < messages.length,
     continuationHint: pruned.length < messages.length,
     shouldInject: true,
+    pruneCutoffAnchor: anchors[cutoffAnchorIndex],
+    protectedTailAnchor: protectedStartID,
+    retainedTailTokens,
+    rawBudgetApplied: false,
   };
 }
 
-function resolveThresholds(config: OmConfig, contextLimit: number): Thresholds {
-  const observationThresholdTokens =
-    config.observeThresholdTokens ??
-    Math.min(30000, Math.floor(contextLimit * 0.35));
-  const reflectionThresholdTokens =
-    config.reflectThresholdTokens ??
-    Math.min(40000, Math.floor(contextLimit * 0.5));
+function resolveThresholds(
+  config: OmConfig,
+  contextLimit: number,
+  state?: OmStateV5,
+): Thresholds {
   const rawMessageBudgetTokens =
     config.rawMessageBudgetTokens ?? Math.floor(contextLimit * 0.25);
+  let observationThresholdTokens = resolveThresholdValue(
+    config.observeThresholdTokens,
+    config.observeThresholdRange,
+    Math.min(30000, Math.floor(contextLimit * 0.35)),
+  );
+  let reflectionThresholdTokens = resolveThresholdValue(
+    config.reflectThresholdTokens,
+    config.reflectThresholdRange,
+    Math.min(40000, Math.floor(contextLimit * 0.5)),
+  );
+  const sharedBudgetTokens = config.shareTokenBudget
+    ? Math.max(MIN_SHARED_BUDGET_TOKENS, contextLimit - rawMessageBudgetTokens)
+    : undefined;
+  if (config.shareTokenBudget) {
+    const memoryTokens = state?.memory.tokenEstimate ?? 0;
+    observationThresholdTokens = Math.min(
+      observationThresholdTokens,
+      Math.max(
+        MIN_SHARED_BUDGET_TOKENS,
+        contextLimit - rawMessageBudgetTokens - memoryTokens,
+      ),
+    );
+    reflectionThresholdTokens = Math.min(
+      reflectionThresholdTokens,
+      sharedBudgetTokens ?? reflectionThresholdTokens,
+    );
+  }
   return {
     observationThresholdTokens,
     reflectionThresholdTokens,
     rawMessageBudgetTokens,
+    tailRetentionUserTurns: Math.max(
+      RECENT_USER_PROTECTION,
+      config.tailRetentionUserTurns ?? RECENT_USER_PROTECTION,
+    ),
+    tailRetentionTokens: config.tailRetentionTokens,
+    shareTokenBudget: config.shareTokenBudget,
+    sharedBudgetTokens,
+    scope: config.scope,
     observeHardOverdue: Math.floor(observationThresholdTokens * 1.5),
     reflectHardOverdue: Math.floor(reflectionThresholdTokens * 1.25),
   };
 }
 
-function statusPayload(state: OmStateV4, config: OmConfig) {
-  const thresholds = resolveThresholds(config, DEFAULT_CONTEXT_LIMIT);
+function statusPayload(state: OmStateV5, config: OmConfig, sessionID = state.sessionID) {
   refreshStateTokenEstimates(state);
+  const thresholds = resolveThresholds(config, DEFAULT_CONTEXT_LIMIT, state);
   evaluateFlags(state, thresholds);
   const observeInput = buildObserveInput(state, config);
-  const promptDiagnostics = runtimeStatus.get(state.sessionID)?.promptDiagnostics;
+  const runtime = runtimeStatus.get(sessionID);
+  const promptDiagnostics = runtime?.promptDiagnostics;
+  const injectedMemoryTokens =
+    promptDiagnostics?.injectedMemoryTokens ??
+    (state.memory.observations
+      ? countStringTokens(renderOmBlock(state.memory, config, thresholds))
+      : 0);
   return {
-    sessionID: state.sessionID,
+    sessionID,
     mode: config.mode,
+    scope: {
+      mode: config.scope,
+      key: state.scopeKey,
+    },
     thresholds,
     current: {
       bufferTokens: state.buffer.tokenEstimateTotal,
@@ -2136,6 +2575,13 @@ function statusPayload(state: OmStateV4, config: OmConfig) {
       observeCursorHint: state.runtime.observeCursorHint,
       observeInputAnchors: observeInput.anchorCount,
       observeInputTokens: observeInput.tokenEstimate,
+      tailRetentionUserTurns: thresholds.tailRetentionUserTurns,
+      tailRetentionTokens: thresholds.tailRetentionTokens,
+      effectiveCutoffAnchor: runtime?.pruneCutoffAnchor,
+      protectedTailAnchor: runtime?.protectedTailAnchor,
+      retainedTailTokens: runtime?.retainedTailTokens ?? 0,
+      shareTokenBudget: thresholds.shareTokenBudget,
+      sharedBudgetTokens: thresholds.sharedBudgetTokens,
       lockContention: !!state.flags.lockContention,
       diagnostics: {
         tokenizer: promptDiagnostics?.tokenizer ?? tokenCounter.tokenizer,
@@ -2150,9 +2596,7 @@ function statusPayload(state: OmStateV4, config: OmConfig) {
         skippedPromptParts:
           promptDiagnostics?.transformedMessages.skippedParts ?? 0,
         injectedSystemTokens: promptDiagnostics?.injectedSystemTokens ?? 0,
-        injectedMemoryTokens:
-          promptDiagnostics?.injectedMemoryTokens ??
-          countInjectedMemoryTokens(state.memory),
+        injectedMemoryTokens,
         injectedTaskHintTokens:
           promptDiagnostics?.injectedTaskHintTokens ??
           countStringTokens(renderTaskHints(state.memory)),
@@ -2181,7 +2625,7 @@ export async function readOmStatus(sessionID: string, directory: string) {
     sessionStatePath(directory, sessionID),
   ]);
   return {
-    status: statusPayload(state, config),
+    status: statusPayload(state, config, sessionID),
     statePath,
   };
 }
@@ -2216,7 +2660,8 @@ async function log(
 }
 
 async function forgetState(sessionID: string, directory: string) {
-  cache.delete(sessionID);
+  const scope = await resolveScopeIdentity(directory, sessionID);
+  cache.delete(scope.key);
   runtimeStatus.delete(sessionID);
   const file = await sessionStatePath(directory, sessionID);
   await fs.rm(file, { force: true }).catch(() => {});
@@ -2226,17 +2671,18 @@ async function withState(
   sessionID: string,
   directory: string,
   mutate: (
-    state: OmStateV4,
+    state: OmStateV5,
     config: OmConfig,
-  ) => Promise<OmStateV4> | OmStateV4,
+  ) => Promise<OmStateV5> | OmStateV5,
   onLockContention?: () => Promise<void>,
 ) {
   const config = await getConfig(directory);
+  const scope = resolveScopeIdentityFromConfig(config, directory, sessionID);
   const state = await loadState(sessionID, directory);
   const lock = await acquireLock(sessionID, directory);
   if (!lock.acquired) {
     state.flags.lockContention = true;
-    cache.set(sessionID, state);
+    cache.set(scope.key, state);
     if (onLockContention) await onLockContention();
     return state;
   }
@@ -2244,10 +2690,13 @@ async function withState(
     refreshStateTokenEstimates(state);
     const next = await mutate(state, config);
     refreshStateTokenEstimates(next);
+    next.sessionID = sessionID;
+    next.scopeMode = scope.mode;
+    next.scopeKey = scope.key;
     next.flags.lockContention = false;
     next.generation += 1;
-    await writeState(directory, next);
-    cache.set(sessionID, next);
+    await writeState(directory, next, sessionID);
+    cache.set(scope.key, next);
     return next;
   } finally {
     await releaseLock(lock.path);
@@ -2255,25 +2704,26 @@ async function withState(
 }
 
 async function loadState(sessionID: string, directory: string) {
-  const cached = cache.get(sessionID);
+  const scope = await resolveScopeIdentity(directory, sessionID);
+  const cached = cache.get(scope.key);
   if (cached) return cached;
   const file = await sessionStatePath(directory, sessionID);
   try {
     const text = await fs.readFile(file, "utf8");
     const parsed = JSON.parse(text);
-    const state = migrateState(sessionID, parsed);
+    const state = migrateState(sessionID, parsed, scope);
     refreshStateTokenEstimates(state);
-    cache.set(sessionID, state);
+    cache.set(scope.key, state);
     return state;
   } catch {
-    const state = createEmptyState(sessionID);
-    cache.set(sessionID, state);
+    const state = createEmptyState(sessionID, scope);
+    cache.set(scope.key, state);
     return state;
   }
 }
 
-async function writeState(directory: string, state: OmStateV4) {
-  const file = await sessionStatePath(directory, state.sessionID);
+async function writeState(directory: string, state: OmStateV5, sessionID: string) {
+  const file = await sessionStatePath(directory, sessionID);
   await fs.mkdir(path.dirname(file), { recursive: true });
   const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
   const handle = await fs.open(temp, "w");
@@ -2323,12 +2773,42 @@ async function releaseLock(lockPath: string) {
 
 async function sessionStatePath(directory: string, sessionID: string) {
   const root = await stateDirectory(directory);
-  return path.join(root, `${sessionID}.json`);
+  const scope = await resolveScopeIdentity(directory, sessionID);
+  return path.join(root, `${scope.key}.json`);
 }
 
 async function sessionLockPath(directory: string, sessionID: string) {
   const root = await stateDirectory(directory);
-  return path.join(root, `${sessionID}.lock`);
+  const scope = await resolveScopeIdentity(directory, sessionID);
+  return path.join(root, `${scope.key}.lock`);
+}
+
+async function resolveScopeIdentity(directory: string, sessionID: string) {
+  const config = await getConfig(directory);
+  return resolveScopeIdentityFromConfig(config, directory, sessionID);
+}
+
+function resolveScopeIdentityFromConfig(
+  config: OmConfig,
+  directory: string,
+  sessionID: string,
+) {
+  if (config.scope === "project") {
+    return {
+      mode: "project" as const,
+      key: `project-${hashText(path.resolve(directory))}`,
+    };
+  }
+  if (config.scope === "global") {
+    return {
+      mode: "global" as const,
+      key: "global",
+    };
+  }
+  return {
+    mode: "session" as const,
+    key: sessionID,
+  };
 }
 
 async function stateDirectory(directory: string) {
@@ -2358,8 +2838,17 @@ async function loadConfig(directory: string): Promise<OmConfig> {
     enabled: true,
     mode: "llm",
     observeThresholdTokens: undefined,
+    observeThresholdRange: undefined,
     reflectThresholdTokens: undefined,
+    reflectThresholdRange: undefined,
     rawMessageBudgetTokens: undefined,
+    tailRetentionUserTurns: RECENT_USER_PROTECTION,
+    tailRetentionTokens: undefined,
+    shareTokenBudget: false,
+    scope: "session",
+    relativeTimeAnnotations: true,
+    relativeTimeLocale: DEFAULT_LOCALE,
+    relativeTimeTimeZone: undefined,
     toolOutputChars: 2000,
     stateDir: "",
     maxObserveInputChars: 24000,
@@ -2388,10 +2877,29 @@ async function loadConfig(directory: string): Promise<OmConfig> {
     ),
     mode: parseMode(process.env.OPENCODE_OM_MODE),
     observeThresholdTokens: parseNumber(process.env.OPENCODE_OM_OBSERVE_TOKENS),
+    observeThresholdRange: parseThresholdRangeFromEnv("OPENCODE_OM_OBSERVE"),
     reflectThresholdTokens: parseNumber(process.env.OPENCODE_OM_REFLECT_TOKENS),
+    reflectThresholdRange: parseThresholdRangeFromEnv("OPENCODE_OM_REFLECT"),
     rawMessageBudgetTokens: parseNumber(
       process.env.OPENCODE_OM_RAW_BUDGET_TOKENS,
     ),
+    tailRetentionUserTurns: parseNumber(process.env.OPENCODE_OM_TAIL_USER_TURNS),
+    tailRetentionTokens: parseNumber(process.env.OPENCODE_OM_TAIL_TOKENS),
+    shareTokenBudget: parseBoolean(
+      process.env.OPENCODE_OM_SHARE_TOKEN_BUDGET,
+      projectConfig.shareTokenBudget ??
+        globalConfig.shareTokenBudget ??
+        defaults.shareTokenBudget,
+    ),
+    scope: parseScope(process.env.OPENCODE_OM_SCOPE),
+    relativeTimeAnnotations: parseBoolean(
+      process.env.OPENCODE_OM_RELATIVE_TIME,
+      projectConfig.relativeTimeAnnotations ??
+        globalConfig.relativeTimeAnnotations ??
+        defaults.relativeTimeAnnotations,
+    ),
+    relativeTimeLocale: process.env.OPENCODE_OM_RELATIVE_TIME_LOCALE,
+    relativeTimeTimeZone: process.env.OPENCODE_OM_RELATIVE_TIME_TZ,
     toolOutputChars:
       parseNumber(process.env.OPENCODE_OM_TOOL_OUTPUT_CHARS) ?? undefined,
     stateDir: process.env.OPENCODE_OM_STATE_DIR,
@@ -2427,16 +2935,61 @@ async function loadConfig(directory: string): Promise<OmConfig> {
       projectConfig.observeThresholdTokens ??
       globalConfig.observeThresholdTokens ??
       defaults.observeThresholdTokens,
+    observeThresholdRange:
+      envConfig.observeThresholdRange ??
+      normalizeThresholdRange(projectConfig.observeThresholdRange) ??
+      normalizeThresholdRange(globalConfig.observeThresholdRange) ??
+      defaults.observeThresholdRange,
     reflectThresholdTokens:
       envConfig.reflectThresholdTokens ??
       projectConfig.reflectThresholdTokens ??
       globalConfig.reflectThresholdTokens ??
       defaults.reflectThresholdTokens,
+    reflectThresholdRange:
+      envConfig.reflectThresholdRange ??
+      normalizeThresholdRange(projectConfig.reflectThresholdRange) ??
+      normalizeThresholdRange(globalConfig.reflectThresholdRange) ??
+      defaults.reflectThresholdRange,
     rawMessageBudgetTokens:
       envConfig.rawMessageBudgetTokens ??
       projectConfig.rawMessageBudgetTokens ??
       globalConfig.rawMessageBudgetTokens ??
       defaults.rawMessageBudgetTokens,
+    tailRetentionUserTurns:
+      envConfig.tailRetentionUserTurns ??
+      projectConfig.tailRetentionUserTurns ??
+      globalConfig.tailRetentionUserTurns ??
+      defaults.tailRetentionUserTurns,
+    tailRetentionTokens:
+      envConfig.tailRetentionTokens ??
+      projectConfig.tailRetentionTokens ??
+      globalConfig.tailRetentionTokens ??
+      defaults.tailRetentionTokens,
+    shareTokenBudget:
+      envConfig.shareTokenBudget ??
+      projectConfig.shareTokenBudget ??
+      globalConfig.shareTokenBudget ??
+      defaults.shareTokenBudget,
+    scope:
+      envConfig.scope ??
+      projectConfig.scope ??
+      globalConfig.scope ??
+      defaults.scope,
+    relativeTimeAnnotations:
+      envConfig.relativeTimeAnnotations ??
+      projectConfig.relativeTimeAnnotations ??
+      globalConfig.relativeTimeAnnotations ??
+      defaults.relativeTimeAnnotations,
+    relativeTimeLocale:
+      envConfig.relativeTimeLocale ??
+      projectConfig.relativeTimeLocale ??
+      globalConfig.relativeTimeLocale ??
+      defaults.relativeTimeLocale,
+    relativeTimeTimeZone:
+      envConfig.relativeTimeTimeZone ??
+      projectConfig.relativeTimeTimeZone ??
+      globalConfig.relativeTimeTimeZone ??
+      defaults.relativeTimeTimeZone,
     toolOutputChars:
       envConfig.toolOutputChars ??
       projectConfig.toolOutputChars ??
@@ -2492,6 +3045,29 @@ function parseNumber(value: string | undefined) {
 function parseMode(value: string | undefined) {
   if (value === "llm" || value === "deterministic") return value;
   return undefined;
+}
+
+function parseScope(value: string | undefined) {
+  if (value === "session" || value === "project" || value === "global") {
+    return value;
+  }
+  return undefined;
+}
+
+function normalizeThresholdRange(value: unknown): ThresholdRange | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const candidate = value as ThresholdRange;
+  const min = typeof candidate.min === "number" ? candidate.min : undefined;
+  const max = typeof candidate.max === "number" ? candidate.max : undefined;
+  if (min === undefined && max === undefined) return undefined;
+  return { min, max };
+}
+
+function parseThresholdRangeFromEnv(prefix: "OPENCODE_OM_OBSERVE" | "OPENCODE_OM_REFLECT") {
+  const min = parseNumber(process.env[`${prefix}_MIN_TOKENS`]);
+  const max = parseNumber(process.env[`${prefix}_MAX_TOKENS`]);
+  if (min === undefined && max === undefined) return undefined;
+  return { min, max };
 }
 
 function setToolDefinitionHint(toolID: MaintenanceToolID | undefined) {
