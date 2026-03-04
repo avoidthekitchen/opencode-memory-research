@@ -161,14 +161,25 @@ async function runPluginSmoke() {
       `Smoke test failed: unexpected tokenizer ${status.current.diagnostics.tokenizer}`,
     );
   }
+  if (
+    !system.system.some((entry) =>
+      entry.includes("Be specific enough for the assistant to act on"),
+    )
+  ) {
+    throw new Error(
+      "Smoke test failed: observer guidelines were not injected into the maintenance prompt.",
+    );
+  }
 
+  const currentTask = "Primary: Continue the smoke-test flow.";
+  const suggestedResponse =
+    "The assistant should continue normally after maintenance.";
   await plugin.tool.om_observe.execute(
     {
       observations:
         "Date: Mar 3, 2026\n* 🔴 (09:00) User asked for a smoke-test observation flow.\n* 🟡 (09:01) Assistant replied with a greeting.",
-      currentTask: "Primary: Continue the smoke-test flow.",
-      suggestedResponse:
-        "The assistant should continue normally after maintenance.",
+      currentTask,
+      suggestedResponse,
       confirmObservedThrough: "user-1",
     },
     { sessionID: "smoke-session", metadata() {} },
@@ -209,6 +220,58 @@ async function runPluginSmoke() {
   if (postStatus.current.diagnostics.injectedMemoryTokens <= 0) {
     throw new Error(
       "Smoke test failed: injected memory token diagnostics were not populated.",
+    );
+  }
+
+  await plugin.tool.om_reflect.execute(
+    {
+      observations:
+        "Date: Mar 3, 2026\n* 🔴 (09:00) User asked for a smoke-test observation flow.\n* 🟡 (09:01) Assistant replied with a greeting.",
+      currentTask,
+      suggestedResponse,
+    },
+    { sessionID: "smoke-session", metadata() {} },
+  );
+
+  const failedReflectStatus = JSON.parse(
+    await plugin.tool.om_status.execute(
+      {},
+      { sessionID: "smoke-session", metadata() {} },
+    ),
+  );
+  if (failedReflectStatus.stats.reflectFailures !== 1) {
+    throw new Error(
+      `Smoke test failed: expected reflectFailures=1 after non-reducing reflection, got ${failedReflectStatus.stats.reflectFailures}`,
+    );
+  }
+
+  await plugin.tool.om_reflect.execute(
+    {
+      observations:
+        "Date: Mar 3, 2026\n* 🔴 (09:00) User requested the OM smoke test.",
+    },
+    { sessionID: "smoke-session", metadata() {} },
+  );
+
+  const exportedState = JSON.parse(
+    await plugin.tool.om_export.execute(
+      {},
+      { sessionID: "smoke-session", metadata() {} },
+    ),
+  );
+  if (exportedState.memory.currentTask !== undefined) {
+    throw new Error(
+      "Smoke test failed: currentTask was not cleared when omitted from om_reflect.",
+    );
+  }
+  if (exportedState.memory.suggestedResponse !== undefined) {
+    throw new Error(
+      "Smoke test failed: suggestedResponse was not cleared when omitted from om_reflect.",
+    );
+  }
+  if (exportedState.stats.reflectFailures !== 0) {
+    throw new Error(
+      `Smoke test failed: expected reflectFailures to reset after successful reflection, got ${exportedState.stats.reflectFailures}`,
     );
   }
 

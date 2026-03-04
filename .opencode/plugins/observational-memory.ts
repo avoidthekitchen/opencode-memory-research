@@ -1360,24 +1360,23 @@ function applyReflectToolResult(
     return state;
   }
 
-  // Validate compression
-  // We expect the new observations to be smaller than the old ones, or at least smaller than the threshold
-  // If not, we reject (unless we are already at max retry level 3, then we accept whatever we got)
+  const previousTokens = countInjectedMemoryTokens(state.memory);
   const nextMemory = {
     ...state.memory,
     observations: sanitized.observations,
-    currentTask: sanitized.hasCurrentTask
-      ? sanitized.currentTask
-      : state.memory.currentTask,
+    currentTask: sanitized.hasCurrentTask ? sanitized.currentTask : undefined,
     suggestedResponse: sanitized.hasSuggestedResponse
       ? sanitized.suggestedResponse
-      : state.memory.suggestedResponse,
+      : undefined,
   };
   const newTokens = countInjectedMemoryTokens(nextMemory);
   const targetThreshold = thresholds.reflectionThresholdTokens;
+  const compressionFailed =
+    state.stats.reflectFailures < 3 &&
+    (newTokens > targetThreshold ||
+      (previousTokens > 0 && newTokens >= previousTokens));
 
-  if (state.stats.reflectFailures < 3 && newTokens > targetThreshold) {
-    // Compression failed to meet target
+  if (compressionFailed) {
     state.stats.reflectFailures += 1;
     state.flags.maintenanceDeferred = true;
     return state;
@@ -1391,12 +1390,12 @@ function applyReflectToolResult(
     config,
     thresholds,
   );
-  if (sanitized.hasCurrentTask) {
-    state.memory.currentTask = sanitized.currentTask;
-  }
-  if (sanitized.hasSuggestedResponse) {
-    state.memory.suggestedResponse = sanitized.suggestedResponse;
-  }
+  state.memory.currentTask = sanitized.hasCurrentTask
+    ? sanitized.currentTask
+    : undefined;
+  state.memory.suggestedResponse = sanitized.hasSuggestedResponse
+    ? sanitized.suggestedResponse
+    : undefined;
   state.memory.tokenEstimate = countInjectedMemoryTokens(state.memory);
   state.memory.updatedAtMs = Date.now();
   state.stats.totalReflections += 1;
@@ -1575,6 +1574,9 @@ function renderObserveMaintenanceBlock(state: OmStateV4, config: OmConfig) {
     OBSERVER_EXTRACTION_INSTRUCTIONS,
     "",
     OBSERVER_OUTPUT_FORMAT,
+    "",
+    "Guidelines:",
+    OBSERVER_GUIDELINES,
     "",
     "Tool args:",
     "- observations: string containing only the <observations> content, without wrapper tags",
